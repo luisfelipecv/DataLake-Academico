@@ -1,0 +1,48 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Athena: WorkGroup dedicado para EDA y consumo SQL del Data Lake.
+  Forza cifrado SSE-KMS de resultados y aplica un cutoff de bytes
+  escaneados por query como salvaguarda de costos.
+
+Parameters:
+  ProjectName:
+    Type: String
+  Environment:
+    Type: String
+  AthenaResultsBucketName:
+    Type: String
+  KmsKeyArn:
+    Type: String
+
+Resources:
+
+  WorkGroup:
+    Type: AWS::Athena::WorkGroup
+    Properties:
+      Name: !Sub "${ProjectName}-workgroup"
+      Description: "WorkGroup de Athena para el Data Lake academico UNAD"
+      State: ENABLED
+      RecursiveDeleteOption: true
+      WorkGroupConfiguration:
+        EnforceWorkGroupConfiguration: true
+        PublishCloudWatchMetricsEnabled: true
+        BytesScannedCutoffPerQuery: 1073741824
+        RequesterPaysEnabled: false
+        EngineVersion:
+          SelectedEngineVersion: AUTO
+        ResultConfiguration:
+          OutputLocation: !Sub "s3://${AthenaResultsBucketName}/queries/"
+          EncryptionConfiguration:
+            EncryptionOption: SSE_KMS
+            KmsKey: !Ref KmsKeyArn
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+Outputs:
+  WorkGroupName:
+    Value: !Ref WorkGroup
+    Export:
+      Name: !Sub "${ProjectName}-workgroup"

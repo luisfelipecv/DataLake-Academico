@@ -1,0 +1,164 @@
+# =============================================================
+# .gitignore — Data Lake Académico UNAD
+# =============================================================
+# Reglas alineadas con buenas prácticas de Data Engineering y
+# con la clasificación de datos del proyecto (Ley 1581 de 2012):
+# microdatos UNAD = Privados/Sensibles, NUNCA al repo público.
+# =============================================================
+
+
+# -------------------------------------------------------------
+# DATASETS — NO subir nunca
+# -------------------------------------------------------------
+# Microdatos UNAD: clasificados como sensibles (Ley 1581).
+# Datos Abiertos / SNIES / SPADIES: públicos pero pesados.
+# Reproducir vía Lambdas (gobierno/UNAD) o `aws s3 sync` (SNIES/SPADIES).
+data/
+
+# Outputs locales de Lambdas en modo DRY_RUN
+**/local_*.csv
+**/local_*.json
+**/local_unad_*.csv
+**/local_gobierno_*.json
+
+
+# -------------------------------------------------------------
+# Credenciales y secretos — JAMÁS al repo
+# -------------------------------------------------------------
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.pfx
+*.p12
+*.crt
+.aws/
+aws-credentials*
+**/credentials
+**/secrets.yaml
+**/secrets.yml
+**/secrets.json
+*.secret
+*_secret.txt
+*_secret.json
+
+# Scripts de configuración local con paths/usernames específicos
+init_config.sh
+init_config.local.sh
+
+
+# -------------------------------------------------------------
+# AWS / IaC — artefactos de build
+# -------------------------------------------------------------
+# Paquetes ZIP de Lambdas (se regeneran con `zip -r`)
+*.zip
+
+# CloudFormation packaging output
+packaged.yaml
+packaged-*.yaml
+.aws-sam/
+samconfig.toml
+
+# Backups locales de las plantillas IaC
+IaC.backup-*/
+*.backup
+*.backup-*
+
+# CDK build output (por si en el futuro)
+cdk.out/
+cdk.context.json
+
+# Spark / Glue temporales
+spark-logs/
+temporary/
+spark-warehouse/
+
+
+# -------------------------------------------------------------
+# Python
+# -------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+*.egg
+
+# Entornos virtuales
+.venv/
+venv/
+env/
+ENV/
+
+# Caches y cobertura
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+nosetests.xml
+
+
+# -------------------------------------------------------------
+# Notebooks
+# -------------------------------------------------------------
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+
+# -------------------------------------------------------------
+# IDEs y editores
+# -------------------------------------------------------------
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+*.sublime-workspace
+*.sublime-project
+
+
+# -------------------------------------------------------------
+# Sistemas operativos
+# -------------------------------------------------------------
+# macOS
+.DS_Store
+**/.DS_Store
+._*
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# Linux
+*~
+.directory
+
+
+# -------------------------------------------------------------
+# Logs y outputs
+# -------------------------------------------------------------
+*.log
+logs/
+out/
+output/
+test-output/
+build/
+dist/
+
+
+# -------------------------------------------------------------
+# Backups
+# -------------------------------------------------------------
+*.bak
+*.orig
+*.rej

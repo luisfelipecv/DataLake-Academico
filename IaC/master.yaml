@@ -1,0 +1,219 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Master stack para el Data Lake academico UNAD. Orquesta el despliegue de la
+  arquitectura serverless tipo Medallion (Bronze/Silver/Gold) en AWS, integrando
+  ingesta automatizada (Lambda), procesamiento (Glue), catalogo (Glue Catalog),
+  consumo SQL (Athena), orquestacion (Step Functions) y scheduler (EventBridge).
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: data-lake-academico
+    AllowedPattern: '[a-z][a-z0-9-]{1,30}'
+    Description: Prefijo para todos los recursos del Data Lake
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, qa, prod]
+    Description: Ambiente logico del despliegue
+  ArtifactsBucketName:
+    Type: String
+    Description: Nombre del bucket de artefactos creado por bootstrap.yaml
+  ArtifactsBucketUrl:
+    Type: String
+    Description: >-
+      URL HTTPS del bucket de artefactos donde residen las plantillas hijas.
+      Formato: https://<bucket>.s3.<region>.amazonaws.com/cfn
+
+  LambdaUnadCodeKey:
+    Type: String
+    Default: lambdas/extract_unad.zip
+    Description: S3 key del paquete ZIP del Lambda de ingesta UNAD
+  LambdaGobiernoCodeKey:
+    Type: String
+    Default: lambdas/extract_gobierno.zip
+    Description: S3 key del paquete ZIP del Lambda de ingesta Gobierno
+  GlueRawToSilverScriptKey:
+    Type: String
+    Default: glue/raw_to_silver.py
+    Description: S3 key del script PySpark Bronze->Silver
+  GlueSilverToGoldScriptKey:
+    Type: String
+    Default: glue/silver_to_gold.py
+    Description: S3 key del script PySpark Silver->Gold
+
+  ScheduleExpression:
+    Type: String
+    Default: "cron(0 7 * * ? *)"
+    Description: Cron del scheduler diario (UTC por defecto, override por timezone en stack hijo)
+  ScheduleState:
+    Type: String
+    Default: DISABLED
+    AllowedValues: [ENABLED, DISABLED]
+    Description: Permite habilitar/deshabilitar el trigger sin redeploy
+
+Resources:
+
+  # 1. Capa criptografica
+  KmsStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub "${ArtifactsBucketUrl}/template-kms.yaml"
+      Parameters:
+        ProjectName: !Ref ProjectName
+        Environment: !Ref Environment
+      TimeoutInMinutes: 10
+
+  # 2. Almacenamiento (Bronze/Silver/Gold/AthenaResults)
+  S3Stack:
+    Type: AWS::CloudFormation::Stack
+    DependsOn: KmsStack
+    Properties:
+      TemplateURL: !Sub "${ArtifactsBucketUrl}/template-s3.yaml"
+      Parameters:
+        ProjectName: !Ref ProjectName
+        Environment: !Ref Environment
+        KmsKeyArn: !GetAtt KmsStack.Outputs.KmsKeyArn
+      TimeoutInMinutes: 10
+
+  # 3. IAM: roles con minimo privilegio para todos los servicios
+  IamStack:
+    Type: AWS::CloudFormation::Stack
+    DependsOn:
+      - KmsStack
+      - S3Stack
+    Properties:
+      TemplateURL: !Sub "${ArtifactsBucketUrl}/template-iam.yaml"
+      Parameters:
+        ProjectName: !Ref ProjectName
+        Environment: !Ref Environment
+        KmsKeyArn: !GetAtt KmsStack.Outputs.KmsKeyArn
+        ArtifactsBucketName: !Ref ArtifactsBucketName
+        RawBucketName: !GetAtt S3Stack.Outputs.RawBucketName
+        SilverBucketName: !GetAtt S3Stack.Outputs.SilverBucketName
+        GoldBucketName: !GetAtt S3Stack.Outputs.GoldBucketName
+      TimeoutInMinutes: 10
+
+  # 4. Funciones Lambda de ingesta (UNAD + Datos Abiertos)
+  LambdasStack:
+    Type: AWS::CloudFormation::Stack
+    DependsOn: IamStack
+    Properties:
+      TemplateURL: !Sub "${ArtifactsBucketUrl}/template-lambdas.yaml"
+      Parameters:
+        ProjectName: !Ref ProjectName
+        Environment: !Ref Environment
+        ArtifactsBucketName: !Ref ArtifactsBucketName
+        LambdaUnadCodeKey: !Ref LambdaUnadCodeKey
+        LambdaGobiernoCodeKey: !Ref LambdaGobiernoCodeKey
+        LambdaExecutionRoleArn: !GetAtt IamStack.Outputs.LambdaExecutionRoleArn
+        RawBucketName: !GetAtt S3Stack.Outputs.RawBucketName
+      TimeoutInMinutes: 15
+
+  # 5. Glue: bases, jobs y crawlers
+  GlueStack:
+    Type: AWS::CloudFormation::Stack
+    DependsOn:
+      - IamStack
+      - S3Stack
+    Properties:
+      TemplateURL: !Sub "${ArtifactsBucketUrl}/template-glue.yaml"
+      Parameters:
+        ProjectName: !Ref ProjectName
+        Environment: !Ref Environment
+        ArtifactsBucketName: !Ref ArtifactsBucketName
+        GlueRawToSilverScriptKey: !Ref GlueRawToSilverScriptKey
+        GlueSilverToGoldScriptKey: !Ref GlueSilverToGoldScriptKey
+        GlueExecutionRoleArn: !GetAtt IamStack.Outputs.GlueExecutionRoleArn
+        RawBucketName: !GetAtt S3Stack.Outputs.RawBucketName
+        SilverBucketName: !GetAtt S3Stack.Outputs.SilverBucketName
+        GoldBucketName: !GetAtt S3Stack.Outputs.GoldBucketName
+      TimeoutInMinutes: 15
+
+  # 6. Athena WorkGroup para EDA y consumo SQL
+  AthenaStack:
+    Type: AWS::CloudFormation::Stack
+    DependsOn:
+      - S3Stack
+      - KmsStack
+    Properties:
+      TemplateURL: !Sub "${ArtifactsBucketUrl}/template-athena.yaml"
+      Parameters:
+        ProjectName: !Ref ProjectName
+        Environment: !Ref Environment
+        AthenaResultsBucketName: !GetAtt S3Stack.Outputs.AthenaResultsBucketName
+        KmsKeyArn: !GetAtt KmsStack.Outputs.KmsKeyArn
+      TimeoutInMinutes: 10
+
+  # 7. Step Functions: orquestacion del pipeline ETL
+  StepStack:
+    Type: AWS::CloudFormation::Stack
+    DependsOn:
+      - LambdasStack
+      - GlueStack
+      - IamStack
+    Properties:
+      TemplateURL: !Sub "${ArtifactsBucketUrl}/template-step.yaml"
+      Parameters:
+        ProjectName: !Ref ProjectName
+        Environment: !Ref Environment
+        StepFunctionRoleArn: !GetAtt IamStack.Outputs.StepFunctionRoleArn
+        LambdaUnadArn: !GetAtt LambdasStack.Outputs.LambdaUnadArn
+        LambdaGobiernoArn: !GetAtt LambdasStack.Outputs.LambdaGobiernoArn
+        GlueRawToSilverJobName: !GetAtt GlueStack.Outputs.RawToSilverJobName
+        GlueSilverToGoldJobName: !GetAtt GlueStack.Outputs.SilverToGoldJobName
+        SilverCrawlerName: !GetAtt GlueStack.Outputs.SilverCrawlerName
+        GoldCrawlerName: !GetAtt GlueStack.Outputs.GoldCrawlerName
+      TimeoutInMinutes: 10
+
+  # 8. EventBridge Scheduler: trigger calendarizado del pipeline
+  EventBridgeStack:
+    Type: AWS::CloudFormation::Stack
+    DependsOn:
+      - StepStack
+      - IamStack
+    Properties:
+      TemplateURL: !Sub "${ArtifactsBucketUrl}/template-eventbridge.yaml"
+      Parameters:
+        ProjectName: !Ref ProjectName
+        Environment: !Ref Environment
+        StateMachineArn: !GetAtt StepStack.Outputs.StateMachineArn
+        EventBridgeRoleArn: !GetAtt IamStack.Outputs.EventBridgeRoleArn
+        ScheduleExpression: !Ref ScheduleExpression
+        ScheduleState: !Ref ScheduleState
+      TimeoutInMinutes: 5
+
+Outputs:
+  RawBucketName:
+    Description: Bucket capa Bronze (Raw)
+    Value: !GetAtt S3Stack.Outputs.RawBucketName
+  SilverBucketName:
+    Description: Bucket capa Silver
+    Value: !GetAtt S3Stack.Outputs.SilverBucketName
+  GoldBucketName:
+    Description: Bucket capa Gold
+    Value: !GetAtt S3Stack.Outputs.GoldBucketName
+  AthenaResultsBucketName:
+    Description: Bucket de resultados de Athena
+    Value: !GetAtt S3Stack.Outputs.AthenaResultsBucketName
+  KmsKeyArn:
+    Description: ARN de la KMS Key del Data Lake
+    Value: !GetAtt KmsStack.Outputs.KmsKeyArn
+  LambdaUnadArn:
+    Description: ARN del Lambda de ingesta UNAD
+    Value: !GetAtt LambdasStack.Outputs.LambdaUnadArn
+  LambdaGobiernoArn:
+    Description: ARN del Lambda de ingesta Gobierno
+    Value: !GetAtt LambdasStack.Outputs.LambdaGobiernoArn
+  StateMachineArn:
+    Description: ARN de la Step Functions State Machine
+    Value: !GetAtt StepStack.Outputs.StateMachineArn
+  AthenaWorkGroupName:
+    Description: Nombre del Athena WorkGroup
+    Value: !GetAtt AthenaStack.Outputs.WorkGroupName
+  SilverDatabaseName:
+    Description: Glue Database Silver
+    Value: !GetAtt GlueStack.Outputs.SilverDatabaseName
+  GoldDatabaseName:
+    Description: Glue Database Gold
+    Value: !GetAtt GlueStack.Outputs.GoldDatabaseName

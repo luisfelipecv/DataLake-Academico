@@ -1,0 +1,13 @@
+templates:
+  - bootstrap.yaml
+  - master.yaml
+  - template-kms.yaml
+  - template-s3.yaml
+  - template-iam.yaml
+  - template-lambdas.yaml
+  - template-glue.yaml
+  - template-step.yaml
+  - template-eventbridge.yaml
+  - template-athena.yaml
+ignore_checks:
+  - W3005

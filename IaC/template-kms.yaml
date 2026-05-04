@@ -1,0 +1,71 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  KMS: llave simetrica con rotacion habilitada para cifrar en reposo los buckets
+  S3 (Raw/Silver/Gold/AthenaResults) y resultados de queries Athena.
+
+Parameters:
+  ProjectName:
+    Type: String
+  Environment:
+    Type: String
+
+Resources:
+  DataLakeKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: !Sub "Llave KMS Data Lake ${ProjectName}"
+      Enabled: true
+      EnableKeyRotation: true
+      PendingWindowInDays: 7
+      KeyPolicy:
+        Version: '2012-10-17'
+        Id: !Sub "${ProjectName}-kms-policy"
+        Statement:
+          - Sid: EnableIAMUserPermissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:root"
+            Action: 'kms:*'
+            Resource: '*'
+          - Sid: AllowCloudWatchLogs
+            Effect: Allow
+            Principal:
+              Service: !Sub "logs.${AWS::Region}.amazonaws.com"
+            Action:
+              - kms:Encrypt*
+              - kms:Decrypt*
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:DescribeKey
+            Resource: '*'
+            Condition:
+              ArnLike:
+                kms:EncryptionContext:aws:logs:arn: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:*"
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  DataLakeKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub "alias/${ProjectName}-kms"
+      TargetKeyId: !Ref DataLakeKey
+
+Outputs:
+  KmsKeyArn:
+    Description: ARN de la KMS Key del Data Lake
+    Value: !GetAtt DataLakeKey.Arn
+    Export:
+      Name: !Sub "${ProjectName}-kms-key-arn"
+  KmsKeyId:
+    Description: ID de la KMS Key
+    Value: !Ref DataLakeKey
+    Export:
+      Name: !Sub "${ProjectName}-kms-key-id"
+  KmsKeyAlias:
+    Description: Alias de la KMS Key
+    Value: !Ref DataLakeKeyAlias
+    Export:
+      Name: !Sub "${ProjectName}-kms-key-alias"

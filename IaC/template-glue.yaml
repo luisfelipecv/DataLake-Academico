@@ -1,0 +1,237 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Glue: bases de datos del catalogo (silver, gold), Glue Jobs Bronze->Silver
+  y Silver->Gold con bookmarks habilitados, y Crawlers para registrar
+  tablas automaticamente en cada capa.
+
+Parameters:
+  ProjectName:
+    Type: String
+  Environment:
+    Type: String
+  ArtifactsBucketName:
+    Type: String
+  GlueRawToSilverScriptKey:
+    Type: String
+  GlueSilverToGoldScriptKey:
+    Type: String
+  GlueExecutionRoleArn:
+    Type: String
+  RawBucketName:
+    Type: String
+  SilverBucketName:
+    Type: String
+  GoldBucketName:
+    Type: String
+
+Resources:
+
+  # LOG GROUP COMPARTIDO PARA GLUE JOBS
+  GlueJobsLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws-glue/jobs/${ProjectName}"
+      RetentionInDays: 14
+
+  # BASES DEL CATALOGO
+  SilverDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: "data_lake_academico_silver"
+        Description: "Capa Silver: datos limpios, tipados y normalizados en formato Parquet"
+
+  GoldDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: "data_lake_academico_gold"
+        Description: "Capa Gold: datos enriquecidos y modelados para analitica y ML"
+
+  # JOB BRONZE -> SILVER
+  RawToSilverJob:
+    Type: AWS::Glue::Job
+    Properties:
+      Name: !Sub "${ProjectName}-raw-to-silver"
+      Description: "Limpia, tipifica y materializa fuentes Bronze (UNAD, Gobierno, SNIES, SPADIES) en Silver"
+      Role: !Ref GlueExecutionRoleArn
+      GlueVersion: "4.0"
+      WorkerType: G.1X
+      NumberOfWorkers: 2
+      Timeout: 60
+      MaxRetries: 1
+      ExecutionProperty:
+        MaxConcurrentRuns: 1
+      Command:
+        Name: glueetl
+        PythonVersion: "3"
+        ScriptLocation: !Sub "s3://${ArtifactsBucketName}/${GlueRawToSilverScriptKey}"
+      DefaultArguments:
+        "--job-language": "python"
+        "--job-bookmark-option": "job-bookmark-enable"
+        "--enable-glue-datacatalog": "true"
+        "--enable-metrics": "true"
+        "--enable-continuous-cloudwatch-log": "true"
+        "--enable-spark-ui": "true"
+        "--spark-event-logs-path": !Sub "s3://${ArtifactsBucketName}/spark-logs/raw-to-silver/"
+        "--TempDir": !Sub "s3://${ArtifactsBucketName}/temporary/raw-to-silver/"
+        "--RAW_BUCKET": !Ref RawBucketName
+        "--SILVER_BUCKET": !Ref SilverBucketName
+        "--SILVER_DATABASE": "data_lake_academico_silver"
+        "--PROJECT_NAME": !Ref ProjectName
+        "--ENVIRONMENT": !Ref Environment
+        "--additional-python-modules": "pyxlsb==1.0.10,openpyxl==3.1.2"
+      Tags:
+        Project: !Ref ProjectName
+        Environment: !Ref Environment
+        Layer: silver
+
+  # JOB SILVER -> GOLD
+  SilverToGoldJob:
+    Type: AWS::Glue::Job
+    Properties:
+      Name: !Sub "${ProjectName}-silver-to-gold"
+      Description: "Cruza UNAD con dimensiones territoriales (Sisben, MinTIC, cobertura, SNIES, SPADIES) y materializa la capa Gold lista para analitica y ML"
+      Role: !Ref GlueExecutionRoleArn
+      GlueVersion: "4.0"
+      WorkerType: G.1X
+      NumberOfWorkers: 2
+      Timeout: 60
+      MaxRetries: 1
+      ExecutionProperty:
+        MaxConcurrentRuns: 1
+      Command:
+        Name: glueetl
+        PythonVersion: "3"
+        ScriptLocation: !Sub "s3://${ArtifactsBucketName}/${GlueSilverToGoldScriptKey}"
+      DefaultArguments:
+        "--job-language": "python"
+        "--job-bookmark-option": "job-bookmark-enable"
+        "--enable-glue-datacatalog": "true"
+        "--enable-metrics": "true"
+        "--enable-continuous-cloudwatch-log": "true"
+        "--enable-spark-ui": "true"
+        "--spark-event-logs-path": !Sub "s3://${ArtifactsBucketName}/spark-logs/silver-to-gold/"
+        "--TempDir": !Sub "s3://${ArtifactsBucketName}/temporary/silver-to-gold/"
+        "--SILVER_BUCKET": !Ref SilverBucketName
+        "--GOLD_BUCKET": !Ref GoldBucketName
+        "--SILVER_DATABASE": "data_lake_academico_silver"
+        "--GOLD_DATABASE": "data_lake_academico_gold"
+        "--PROJECT_NAME": !Ref ProjectName
+        "--ENVIRONMENT": !Ref Environment
+      Tags:
+        Project: !Ref ProjectName
+        Environment: !Ref Environment
+        Layer: gold
+
+  # CRAWLER SILVER
+  SilverCrawler:
+    Type: AWS::Glue::Crawler
+    Properties:
+      Name: !Sub "${ProjectName}-crawler-silver"
+      Description: "Registra/actualiza tablas de la capa Silver en el Glue Data Catalog"
+      Role: !Ref GlueExecutionRoleArn
+      DatabaseName: !Ref SilverDatabase
+      Targets:
+        S3Targets:
+          - Path: !Sub "s3://${SilverBucketName}/"
+            Exclusions:
+              - "**_temporary/**"
+              - "**_SUCCESS"
+      TablePrefix: ""
+      SchemaChangePolicy:
+        UpdateBehavior: UPDATE_IN_DATABASE
+        DeleteBehavior: DEPRECATE_IN_DATABASE
+      RecrawlPolicy:
+        RecrawlBehavior: CRAWL_EVERYTHING
+      Configuration: |
+        {
+          "Version": 1.0,
+          "CrawlerOutput": {
+            "Partitions": {"AddOrUpdateBehavior": "InheritFromTable"}
+          }
+        }
+      Tags:
+        Project: !Ref ProjectName
+        Environment: !Ref Environment
+
+  # CRAWLER GOLD
+  GoldCrawler:
+    Type: AWS::Glue::Crawler
+    Properties:
+      Name: !Sub "${ProjectName}-crawler-gold"
+      Description: "Registra/actualiza tablas de la capa Gold en el Glue Data Catalog"
+      Role: !Ref GlueExecutionRoleArn
+      DatabaseName: !Ref GoldDatabase
+      Targets:
+        S3Targets:
+          - Path: !Sub "s3://${GoldBucketName}/"
+            Exclusions:
+              - "**_temporary/**"
+              - "**_SUCCESS"
+      TablePrefix: ""
+      SchemaChangePolicy:
+        UpdateBehavior: UPDATE_IN_DATABASE
+        DeleteBehavior: DEPRECATE_IN_DATABASE
+      RecrawlPolicy:
+        RecrawlBehavior: CRAWL_EVERYTHING
+      Configuration: |
+        {
+          "Version": 1.0,
+          "CrawlerOutput": {
+            "Partitions": {"AddOrUpdateBehavior": "InheritFromTable"}
+          }
+        }
+      Tags:
+        Project: !Ref ProjectName
+        Environment: !Ref Environment
+
+  # ALARMA: fallos en Glue Jobs
+  RawToSilverFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${ProjectName}-alarm-raw-to-silver-failures"
+      AlarmDescription: "Glue Job raw-to-silver fallo en las ultimas ejecuciones"
+      Namespace: Glue
+      MetricName: glue.driver.aggregate.numFailedTasks
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      Dimensions:
+        - Name: JobName
+          Value: !Ref RawToSilverJob
+        - Name: JobRunId
+          Value: ALL
+        - Name: Type
+          Value: count
+
+Outputs:
+  SilverDatabaseName:
+    Value: !Ref SilverDatabase
+    Export:
+      Name: !Sub "${ProjectName}-glue-db-silver"
+  GoldDatabaseName:
+    Value: !Ref GoldDatabase
+    Export:
+      Name: !Sub "${ProjectName}-glue-db-gold"
+  RawToSilverJobName:
+    Value: !Ref RawToSilverJob
+    Export:
+      Name: !Sub "${ProjectName}-raw-to-silver"
+  SilverToGoldJobName:
+    Value: !Ref SilverToGoldJob
+    Export:
+      Name: !Sub "${ProjectName}-silver-to-gold"
+  SilverCrawlerName:
+    Value: !Ref SilverCrawler
+    Export:
+      Name: !Sub "${ProjectName}-crawler-silver"
+  GoldCrawlerName:
+    Value: !Ref GoldCrawler
+    Export:
+      Name: !Sub "${ProjectName}-crawler-gold"

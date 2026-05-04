@@ -1,0 +1,327 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Step Functions: orquesta el pipeline ETL Medallion. Ingesta paralela
+  (Map sobre periodos UNAD y datasets de Gobierno), corre Glue raw->silver,
+  espera al Crawler Silver, corre Glue silver->gold y espera al Crawler Gold.
+
+Parameters:
+  ProjectName:
+    Type: String
+  Environment:
+    Type: String
+  StepFunctionRoleArn:
+    Type: String
+  LambdaUnadArn:
+    Type: String
+  LambdaGobiernoArn:
+    Type: String
+  GlueRawToSilverJobName:
+    Type: String
+  GlueSilverToGoldJobName:
+    Type: String
+  SilverCrawlerName:
+    Type: String
+  GoldCrawlerName:
+    Type: String
+
+Resources:
+
+  StepFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/vendedlogs/states/${ProjectName}-etl-pipeline"
+      RetentionInDays: 14
+
+  EtlPipelineStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: !Sub "${ProjectName}-etl-pipeline"
+      StateMachineType: STANDARD
+      RoleArn: !Ref StepFunctionRoleArn
+      LoggingConfiguration:
+        Destinations:
+          - CloudWatchLogsLogGroup:
+              LogGroupArn: !GetAtt StepFunctionLogGroup.Arn
+        IncludeExecutionData: true
+        Level: ERROR
+      TracingConfiguration:
+        Enabled: true
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+      DefinitionSubstitutions:
+        LambdaUnadArn: !Ref LambdaUnadArn
+        LambdaGobiernoArn: !Ref LambdaGobiernoArn
+        GlueRawToSilverJobName: !Ref GlueRawToSilverJobName
+        GlueSilverToGoldJobName: !Ref GlueSilverToGoldJobName
+        SilverCrawlerName: !Ref SilverCrawlerName
+        GoldCrawlerName: !Ref GoldCrawlerName
+      DefinitionString: |-
+        {
+          "Comment": "Pipeline ETL Medallion: ingesta paralela (UNAD + Gobierno) -> Glue Raw->Silver -> Crawler Silver -> Glue Silver->Gold -> Crawler Gold",
+          "StartAt": "ParallelIngestion",
+          "States": {
+            "ParallelIngestion": {
+              "Type": "Parallel",
+              "ResultPath": "$.ingestion",
+              "Branches": [
+                {
+                  "StartAt": "MapUnadPeriods",
+                  "States": {
+                    "MapUnadPeriods": {
+                      "Type": "Map",
+                      "ItemsPath": "$.unadPeriods",
+                      "MaxConcurrency": 3,
+                      "ItemProcessor": {
+                        "ProcessorConfig": {"Mode": "INLINE"},
+                        "StartAt": "InvokeExtractUnad",
+                        "States": {
+                          "InvokeExtractUnad": {
+                            "Type": "Task",
+                            "Resource": "arn:aws:states:::lambda:invoke",
+                            "Parameters": {
+                              "FunctionName": "${LambdaUnadArn}",
+                              "Payload.$": "$"
+                            },
+                            "OutputPath": "$.Payload",
+                            "Retry": [
+                              {
+                                "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException", "Lambda.TooManyRequestsException", "States.TaskFailed", "States.Timeout"],
+                                "IntervalSeconds": 5,
+                                "MaxAttempts": 3,
+                                "BackoffRate": 2.0
+                              }
+                            ],
+                            "End": true
+                          }
+                        }
+                      },
+                      "End": true
+                    }
+                  }
+                },
+                {
+                  "StartAt": "MapGobiernoDatasets",
+                  "States": {
+                    "MapGobiernoDatasets": {
+                      "Type": "Map",
+                      "ItemsPath": "$.gobiernoDatasets",
+                      "MaxConcurrency": 3,
+                      "ItemProcessor": {
+                        "ProcessorConfig": {"Mode": "INLINE"},
+                        "StartAt": "InvokeExtractGobierno",
+                        "States": {
+                          "InvokeExtractGobierno": {
+                            "Type": "Task",
+                            "Resource": "arn:aws:states:::lambda:invoke",
+                            "Parameters": {
+                              "FunctionName": "${LambdaGobiernoArn}",
+                              "Payload.$": "$"
+                            },
+                            "OutputPath": "$.Payload",
+                            "Retry": [
+                              {
+                                "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException", "Lambda.TooManyRequestsException", "States.TaskFailed", "States.Timeout"],
+                                "IntervalSeconds": 10,
+                                "MaxAttempts": 3,
+                                "BackoffRate": 2.0
+                              }
+                            ],
+                            "End": true
+                          }
+                        }
+                      },
+                      "End": true
+                    }
+                  }
+                }
+              ],
+              "Catch": [
+                {
+                  "ErrorEquals": ["States.ALL"],
+                  "ResultPath": "$.error",
+                  "Next": "PipelineFailed"
+                }
+              ],
+              "Next": "RawToSilverJob"
+            },
+            "RawToSilverJob": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::glue:startJobRun.sync",
+              "Parameters": {
+                "JobName": "${GlueRawToSilverJobName}"
+              },
+              "ResultPath": "$.rawToSilverResult",
+              "Retry": [
+                {
+                  "ErrorEquals": ["Glue.ConcurrentRunsExceededException"],
+                  "IntervalSeconds": 30,
+                  "MaxAttempts": 3,
+                  "BackoffRate": 2.0
+                }
+              ],
+              "Catch": [
+                {
+                  "ErrorEquals": ["States.ALL"],
+                  "ResultPath": "$.error",
+                  "Next": "PipelineFailed"
+                }
+              ],
+              "Next": "StartSilverCrawler"
+            },
+            "StartSilverCrawler": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::aws-sdk:glue:startCrawler",
+              "Parameters": {
+                "Name": "${SilverCrawlerName}"
+              },
+              "ResultPath": null,
+              "Catch": [
+                {
+                  "ErrorEquals": ["Glue.CrawlerRunningException"],
+                  "ResultPath": null,
+                  "Next": "WaitSilverCrawler"
+                },
+                {
+                  "ErrorEquals": ["States.ALL"],
+                  "ResultPath": "$.error",
+                  "Next": "PipelineFailed"
+                }
+              ],
+              "Next": "WaitSilverCrawler"
+            },
+            "WaitSilverCrawler": {
+              "Type": "Wait",
+              "Seconds": 60,
+              "Next": "GetSilverCrawlerStatus"
+            },
+            "GetSilverCrawlerStatus": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::aws-sdk:glue:getCrawler",
+              "Parameters": {
+                "Name": "${SilverCrawlerName}"
+              },
+              "ResultPath": "$.silverCrawlerStatus",
+              "Next": "IsSilverCrawlerReady"
+            },
+            "IsSilverCrawlerReady": {
+              "Type": "Choice",
+              "Choices": [
+                {
+                  "Variable": "$.silverCrawlerStatus.Crawler.State",
+                  "StringEquals": "READY",
+                  "Next": "SilverToGoldJob"
+                }
+              ],
+              "Default": "WaitSilverCrawler"
+            },
+            "SilverToGoldJob": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::glue:startJobRun.sync",
+              "Parameters": {
+                "JobName": "${GlueSilverToGoldJobName}"
+              },
+              "ResultPath": "$.silverToGoldResult",
+              "Retry": [
+                {
+                  "ErrorEquals": ["Glue.ConcurrentRunsExceededException"],
+                  "IntervalSeconds": 30,
+                  "MaxAttempts": 3,
+                  "BackoffRate": 2.0
+                }
+              ],
+              "Catch": [
+                {
+                  "ErrorEquals": ["States.ALL"],
+                  "ResultPath": "$.error",
+                  "Next": "PipelineFailed"
+                }
+              ],
+              "Next": "StartGoldCrawler"
+            },
+            "StartGoldCrawler": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::aws-sdk:glue:startCrawler",
+              "Parameters": {
+                "Name": "${GoldCrawlerName}"
+              },
+              "ResultPath": null,
+              "Catch": [
+                {
+                  "ErrorEquals": ["Glue.CrawlerRunningException"],
+                  "ResultPath": null,
+                  "Next": "WaitGoldCrawler"
+                },
+                {
+                  "ErrorEquals": ["States.ALL"],
+                  "ResultPath": "$.error",
+                  "Next": "PipelineFailed"
+                }
+              ],
+              "Next": "WaitGoldCrawler"
+            },
+            "WaitGoldCrawler": {
+              "Type": "Wait",
+              "Seconds": 60,
+              "Next": "GetGoldCrawlerStatus"
+            },
+            "GetGoldCrawlerStatus": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::aws-sdk:glue:getCrawler",
+              "Parameters": {
+                "Name": "${GoldCrawlerName}"
+              },
+              "ResultPath": "$.goldCrawlerStatus",
+              "Next": "IsGoldCrawlerReady"
+            },
+            "IsGoldCrawlerReady": {
+              "Type": "Choice",
+              "Choices": [
+                {
+                  "Variable": "$.goldCrawlerStatus.Crawler.State",
+                  "StringEquals": "READY",
+                  "Next": "PipelineSucceeded"
+                }
+              ],
+              "Default": "WaitGoldCrawler"
+            },
+            "PipelineSucceeded": {
+              "Type": "Succeed"
+            },
+            "PipelineFailed": {
+              "Type": "Fail",
+              "Error": "ETLPipelineError",
+              "Cause": "Pipeline ETL fallo en alguno de los pasos. Revisar $.error en CloudWatch."
+            }
+          }
+        }
+
+  # ALARMA: ejecuciones fallidas de la State Machine
+  StateMachineFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${ProjectName}-alarm-failed-executions"
+      AlarmDescription: "La State Machine del pipeline ETL ha fallado"
+      Namespace: AWS/States
+      MetricName: ExecutionsFailed
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      Dimensions:
+        - Name: StateMachineArn
+          Value: !Ref EtlPipelineStateMachine
+
+Outputs:
+  StateMachineArn:
+    Value: !Ref EtlPipelineStateMachine
+    Export:
+      Name: !Sub "${ProjectName}-stepfunctions-arn"
+  StateMachineName:
+    Value: !GetAtt EtlPipelineStateMachine.Name
+    Export:
+      Name: !Sub "${ProjectName}-stepfunctions-name"

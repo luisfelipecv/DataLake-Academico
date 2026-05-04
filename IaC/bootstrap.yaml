@@ -1,0 +1,95 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Bootstrap stack para el Data Lake UNAD: crea el bucket de artefactos
+  donde se almacenan plantillas CloudFormation hijas, paquetes ZIP de Lambda
+  y scripts de Glue. Debe desplegarse antes que el master.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: data-lake-academico
+    AllowedPattern: '[a-z][a-z0-9-]{1,30}'
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, qa, prod]
+
+Resources:
+  ArtifactsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${ProjectName}-artifacts-${AWS::AccountId}"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireOldArtifactVersions
+            Status: Enabled
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 30
+          - Id: AbortIncompleteMultipartUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Layer
+          Value: artifacts
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  ArtifactsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ArtifactsBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !Sub "arn:${AWS::Partition}:s3:::${ArtifactsBucket}"
+              - !Sub "arn:${AWS::Partition}:s3:::${ArtifactsBucket}/*"
+            Condition:
+              Bool:
+                'aws:SecureTransport': 'false'
+          - Sid: DenyUnencryptedObjectUploads
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:PutObject'
+            Resource: !Sub "arn:${AWS::Partition}:s3:::${ArtifactsBucket}/*"
+            Condition:
+              StringNotEquals:
+                's3:x-amz-server-side-encryption': 'AES256'
+
+Outputs:
+  ArtifactsBucketName:
+    Description: Nombre del bucket de artefactos
+    Value: !Ref ArtifactsBucket
+    Export:
+      Name: !Sub "${ProjectName}-artifacts-bucket-name"
+  ArtifactsBucketArn:
+    Description: ARN del bucket de artefactos
+    Value: !GetAtt ArtifactsBucket.Arn
+    Export:
+      Name: !Sub "${ProjectName}-artifacts-bucket-arn"
+  ArtifactsBucketUrl:
+    Description: URL HTTPS base del bucket para usar como TemplateURL prefix
+    Value: !Sub "https://${ArtifactsBucket}.s3.${AWS::Region}.amazonaws.com/cfn"
+    Export:
+      Name: !Sub "${ProjectName}-artifacts-bucket-url"

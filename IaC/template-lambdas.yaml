@@ -1,0 +1,158 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Lambdas de ingesta del Data Lake: extraccion de microdatos UNAD via POST
+  HTML form, y extraccion paginada de datasets de Datos Abiertos Colombia
+  (Socrata API). Codigo se carga desde el bucket de artefactos como ZIP.
+
+Parameters:
+  ProjectName:
+    Type: String
+  Environment:
+    Type: String
+  ArtifactsBucketName:
+    Type: String
+  LambdaUnadCodeKey:
+    Type: String
+  LambdaGobiernoCodeKey:
+    Type: String
+  LambdaExecutionRoleArn:
+    Type: String
+  RawBucketName:
+    Type: String
+
+Resources:
+
+  # LAMBDA INGESTA UNAD
+  LambdaUnadLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${ProjectName}-extract-unad"
+      RetentionInDays: 14
+
+  LambdaUnad:
+    Type: AWS::Lambda::Function
+    DependsOn: LambdaUnadLogGroup
+    Properties:
+      FunctionName: !Sub "${ProjectName}-extract-unad"
+      Description: "Extrae microdatos academicos del portal UNAD via POST y los deposita en la capa Bronze"
+      Runtime: python3.11
+      Handler: lambda_function.lambda_handler
+      Architectures: [arm64]
+      Code:
+        S3Bucket: !Ref ArtifactsBucketName
+        S3Key: !Ref LambdaUnadCodeKey
+      Role: !Ref LambdaExecutionRoleArn
+      Timeout: 300
+      MemorySize: 512
+      Environment:
+        Variables:
+          DATA_LAKE_BUCKET: !Ref RawBucketName
+          PROJECT_NAME: !Ref ProjectName
+          ENVIRONMENT: !Ref Environment
+          LOG_LEVEL: INFO
+          METRICS_NAMESPACE: !Sub "${ProjectName}/Ingestion"
+          SOURCE_NAME: unad
+      TracingConfig:
+        Mode: Active
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Source
+          Value: unad
+
+  # LAMBDA INGESTA GOBIERNO (Datos Abiertos Colombia / Socrata)
+  LambdaGobiernoLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${ProjectName}-extract-gobierno"
+      RetentionInDays: 14
+
+  LambdaGobierno:
+    Type: AWS::Lambda::Function
+    DependsOn: LambdaGobiernoLogGroup
+    Properties:
+      FunctionName: !Sub "${ProjectName}-extract-gobierno"
+      Description: "Extrae datasets paginados de datos.gov.co y los streamea a la capa Bronze"
+      Runtime: python3.11
+      Handler: lambda_function.lambda_handler
+      Architectures: [arm64]
+      Code:
+        S3Bucket: !Ref ArtifactsBucketName
+        S3Key: !Ref LambdaGobiernoCodeKey
+      Role: !Ref LambdaExecutionRoleArn
+      Timeout: 900
+      MemorySize: 2048
+      Environment:
+        Variables:
+          DATA_LAKE_BUCKET: !Ref RawBucketName
+          PROJECT_NAME: !Ref ProjectName
+          ENVIRONMENT: !Ref Environment
+          LOG_LEVEL: INFO
+          METRICS_NAMESPACE: !Sub "${ProjectName}/Ingestion"
+          SOURCE_NAME: gobierno
+          PAGE_LIMIT: "50000"
+      TracingConfig:
+        Mode: Active
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Source
+          Value: gobierno
+
+  # ALARMA: errores en Lambda UNAD
+  LambdaUnadErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${ProjectName}-alarm-extract-unad-errors"
+      AlarmDescription: "Lambda extract-unad presenta errores en las ultimas ejecuciones"
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref LambdaUnad
+
+  # ALARMA: errores en Lambda Gobierno
+  LambdaGobiernoErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${ProjectName}-alarm-extract-gobierno-errors"
+      AlarmDescription: "Lambda extract-gobierno presenta errores en las ultimas ejecuciones"
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref LambdaGobierno
+
+Outputs:
+  LambdaUnadName:
+    Value: !Ref LambdaUnad
+    Export:
+      Name: !Sub "${ProjectName}-extract-unad-name"
+  LambdaUnadArn:
+    Value: !GetAtt LambdaUnad.Arn
+    Export:
+      Name: !Sub "${ProjectName}-extract-unad-arn"
+  LambdaGobiernoName:
+    Value: !Ref LambdaGobierno
+    Export:
+      Name: !Sub "${ProjectName}-extract-gobierno-name"
+  LambdaGobiernoArn:
+    Value: !GetAtt LambdaGobierno.Arn
+    Export:
+      Name: !Sub "${ProjectName}-extract-gobierno-arn"

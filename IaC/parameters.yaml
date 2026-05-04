@@ -1,0 +1,17 @@
+template-file-path: master.yaml
+parameters:
+  ProjectName: data-lake-academico
+  Environment: dev
+  ArtifactsBucketName: REPLACE_WITH_BOOTSTRAP_OUTPUT
+  ArtifactsBucketUrl: REPLACE_WITH_BOOTSTRAP_OUTPUT
+  LambdaUnadCodeKey: lambdas/extract_unad.zip
+  LambdaGobiernoCodeKey: lambdas/extract_gobierno.zip
+  GlueRawToSilverScriptKey: glue/raw_to_silver.py
+  GlueSilverToGoldScriptKey: glue/silver_to_gold.py
+  ScheduleExpression: "cron(0 7 * * ? *)"
+  ScheduleState: DISABLED
+tags:
+  Project: data-lake-academico
+  Environment: dev
+  ManagedBy: CloudFormation
+  Owner: trabajo-de-grado-unad

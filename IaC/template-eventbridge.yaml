@@ -1,0 +1,75 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  EventBridge Scheduler: dispara la State Machine del pipeline ETL diariamente.
+  Por defecto se crea en estado DISABLED para evitar costos en dev. El input
+  contiene los periodos UNAD y dataset_ids de Gobierno a procesar.
+
+Parameters:
+  ProjectName:
+    Type: String
+  Environment:
+    Type: String
+  StateMachineArn:
+    Type: String
+  EventBridgeRoleArn:
+    Type: String
+  ScheduleExpression:
+    Type: String
+    Default: "cron(0 7 * * ? *)"
+  ScheduleState:
+    Type: String
+    Default: DISABLED
+    AllowedValues: [ENABLED, DISABLED]
+
+Resources:
+
+  ScheduleGroup:
+    Type: AWS::Scheduler::ScheduleGroup
+    Properties:
+      Name: !Sub "${ProjectName}-events-group"
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  DailyEtlTrigger:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: !Sub "${ProjectName}-daily-trigger"
+      Description: "Trigger diario del pipeline ETL UNAD Data Lake"
+      GroupName: !Ref ScheduleGroup
+      ScheduleExpression: !Ref ScheduleExpression
+      ScheduleExpressionTimezone: "America/Bogota"
+      State: !Ref ScheduleState
+      FlexibleTimeWindow:
+        Mode: "OFF"
+      Target:
+        Arn: !Ref StateMachineArn
+        RoleArn: !Ref EventBridgeRoleArn
+        Input: |
+          {
+            "unadPeriods": [
+              {"periodo": "2031"},
+              {"periodo": "2032"},
+              {"periodo": "2033"},
+              {"periodo": "2034"},
+              {"periodo": "2035"}
+            ],
+            "gobiernoDatasets": [
+              {"dataset_id": "hq2v-5umk", "limit": 50000},
+              {"dataset_id": "n48w-gutb", "limit": 50000},
+              {"dataset_id": "ji8i-4anb", "limit": 50000},
+              {"dataset_id": "6v4n-7ahj", "limit": 50000},
+              {"dataset_id": "nkjx-rsq7", "limit": 50000}
+            ]
+          }
+        RetryPolicy:
+          MaximumRetryAttempts: 3
+          MaximumEventAgeInSeconds: 3600
+
+Outputs:
+  ScheduleGroupName:
+    Value: !Ref ScheduleGroup
+  ScheduleName:
+    Value: !Ref DailyEtlTrigger
