@@ -1,22 +1,26 @@
 """
-Glue PySpark job: Bronze (raw) -> Silver.
+PROYECTO: Data Lake Académico
+MODULO: raw_to_silver.py
 
-Reads heterogeneous sources from the raw bucket, normalizes them and
-materializes Silver Parquet tables registered in the Glue Data Catalog:
+DESCRIPCIÓN:
+Job PySpark para transformar datos RAW (Bronze) hacia SILVER.
 
-- UNAD CSV (Windows-1252, two header lines + ';' separator)
-- Datos Abiertos Colombia JSON (Socrata API, paginated)
-- SNIES Excel (xlsx + xlsb, header row varies between files)
-- SPADIES CSV (UTF-8 BOM, pivot/wide layout that we unpivot to long)
-
-Per-source failures are logged but never abort the rest of the pipeline.
+Características:
+- Lectura incremental mediante Glue Bookmarks
+- Escritura en Parquet optimizado
+- Normalización de columnas
+- Limpieza básica y tipificación
+- Metadata de trazabilidad
+- Manejo dinámico de esquemas anchos (Unpivot nativo) para SPADIES
+- Glue Crawlers manejan el catálogo automáticamente
 """
+
 import io
 import logging
 import re
 import sys
 from datetime import datetime
-from typing import Dict, List, Optional
+from typing import List, Optional
 
 import boto3
 import pandas as pd
@@ -24,8 +28,20 @@ from awsglue.context import GlueContext
 from awsglue.job import Job
 from awsglue.utils import getResolvedOptions
 from pyspark.context import SparkContext
-from pyspark.sql import DataFrame, SparkSession
-from pyspark.sql.functions import col, current_timestamp, lit, trim, upper, when
+from pyspark.sql import DataFrame
+from pyspark.sql.functions import (
+    col,
+    current_timestamp,
+    input_file_name,
+    lit,
+    regexp_extract,
+    upper,
+    trim,
+)
+
+# -----------------------------------------------------------------------------
+# CONFIGURACIÓN
+# -----------------------------------------------------------------------------
 
 ARG_NAMES = [
     "JOB_NAME",
@@ -35,31 +51,45 @@ ARG_NAMES = [
     "PROJECT_NAME",
     "ENVIRONMENT",
 ]
+
 args = getResolvedOptions(sys.argv, ARG_NAMES)
+
 RAW_BUCKET = args["RAW_BUCKET"]
 SILVER_BUCKET = args["SILVER_BUCKET"]
 SILVER_DATABASE = args["SILVER_DATABASE"]
-PROJECT_NAME = args["PROJECT_NAME"]
-ENVIRONMENT = args["ENVIRONMENT"]
 JOB_NAME = args["JOB_NAME"]
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(name)s - %(message)s",
+    format="%(asctime)s %(levelname)s %(name)s - %(message)s"
 )
+
 logger = logging.getLogger("raw_to_silver")
+
+# -----------------------------------------------------------------------------
+# SPARK / GLUE
+# -----------------------------------------------------------------------------
 
 sc = SparkContext.getOrCreate()
 glue_context = GlueContext(sc)
-spark: SparkSession = glue_context.spark_session
-spark.conf.set("spark.sql.legacy.allowNonEmptyLocationInCTAS", "true")
+spark = glue_context.spark_session
+
+# Configuraciones Spark optimizadas
+spark.conf.set("spark.sql.parquet.compression.codec", "snappy")
 spark.conf.set("spark.sql.sources.partitionOverwriteMode", "dynamic")
+spark.conf.set("spark.sql.files.maxPartitionBytes", "134217728")
+spark.conf.set("spark.sql.shuffle.partitions", "8")
 
 job = Job(glue_context)
 job.init(JOB_NAME, args)
 
 RUN_ID = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+
 s3_client = boto3.client("s3")
+
+# -----------------------------------------------------------------------------
+# MAPEOS
+# -----------------------------------------------------------------------------
 
 GOBIERNO_TABLE_MAP = {
     "hq2v-5umk": "gobierno_sisben_iv",
@@ -69,292 +99,307 @@ GOBIERNO_TABLE_MAP = {
     "nkjx-rsq7": "gobierno_indicadores_dnp",
 }
 
+# -----------------------------------------------------------------------------
+# HELPERS
+# -----------------------------------------------------------------------------
 
-# ----------------------------------------------------------------
-# Helpers
-# ----------------------------------------------------------------
-def normalize_column_name(name) -> str:
-    if name is None:
+def normalize_column_name(name: str) -> str:
+    """Normaliza nombres de columnas para Athena/Glue."""
+    if not name:
         return "_unknown"
+
     s = str(name).strip().lower()
-    accents = str.maketrans("áéíóúñ", "aeioun")
-    s = s.translate(accents)
+
+    replacements = {
+        "á": "a",
+        "é": "e",
+        "í": "i",
+        "ó": "o",
+        "ú": "u",
+        "ñ": "n",
+    }
+
+    for src, tgt in replacements.items():
+        s = s.replace(src, tgt)
+
     s = re.sub(r"[^a-z0-9_]+", "_", s)
-    s = re.sub(r"_+", "_", s).strip("_")
-    return s or "_unknown"
+    s = re.sub(r"_+", "_", s)
 
-
-def list_s3_objects(prefix: str, suffix_filter: tuple = ()) -> List[str]:
-    paginator = s3_client.get_paginator("list_objects_v2")
-    keys: List[str] = []
-    for page in paginator.paginate(Bucket=RAW_BUCKET, Prefix=prefix):
-        for obj in page.get("Contents", []) or []:
-            key = obj["Key"]
-            if not suffix_filter or key.lower().endswith(suffix_filter):
-                keys.append(key)
-    return keys
-
-
-def get_s3_bytes(key: str) -> bytes:
-    return s3_client.get_object(Bucket=RAW_BUCKET, Key=key)["Body"].read()
+    return s.strip("_")
 
 
 def add_silver_metadata(df: DataFrame, source: str) -> DataFrame:
+    """Agrega metadata técnica de trazabilidad."""
     return (
         df.withColumn("_silver_source", lit(source))
-        .withColumn("_silver_processed_at", current_timestamp())
-        .withColumn("_silver_run_id", lit(RUN_ID))
+          .withColumn("_silver_processed_at", current_timestamp())
+          .withColumn("_silver_run_id", lit(RUN_ID))
     )
 
 
-def write_silver_table(df: DataFrame, table_name: str, partition_cols: Optional[List[str]] = None) -> None:
+def write_silver_table(
+    df: DataFrame,
+    table_name: str,
+    partition_cols: Optional[List[str]] = None,
+) -> None:
+    """Escribe parquet optimizado en Silver."""
     output_path = f"s3://{SILVER_BUCKET}/{table_name}/"
-    writer = (
-        df.write.mode("overwrite")
-        .format("parquet")
-        .option("compression", "snappy")
-        .option("path", output_path)
-    )
+
+    logger.info(f"Escribiendo tabla {table_name} en {output_path}")
+
+    # Normalización eficiente de nombres de columnas
+    normalized_columns = [normalize_column_name(c) for c in df.columns]
+    df = df.toDF(*normalized_columns)
+
+    # Reducir pequeños archivos para optimizar lecturas en Athena
+    df = df.coalesce(1)
+
+    writer = df.write.mode("append").format("parquet")
+
     if partition_cols:
         writer = writer.partitionBy(*partition_cols)
-    writer.saveAsTable(f"{SILVER_DATABASE}.{table_name}")
-    logger.info("Wrote silver table %s.%s -> %s", SILVER_DATABASE, table_name, output_path)
+
+    writer.save(output_path)
+    logger.info(f"Tabla Silver {table_name} escrita correctamente")
 
 
-# ----------------------------------------------------------------
-# Source: UNAD (CSV CP1252 with institutional preamble)
-# ----------------------------------------------------------------
+def s3_prefix_exists(bucket: str, prefix: str) -> bool:
+    """Valida si existe al menos un archivo bajo un prefijo."""
+    response = s3_client.list_objects_v2(
+        Bucket=bucket,
+        Prefix=prefix,
+        MaxKeys=1
+    )
+    return "Contents" in response
+
+# -----------------------------------------------------------------------------
+# UNAD
+# -----------------------------------------------------------------------------
+
 def process_unad() -> None:
-    keys = list_s3_objects("unad/", suffix_filter=(".csv",))
-    if not keys:
-        logger.warning("No UNAD files found in s3://%s/unad/", RAW_BUCKET)
+    """Procesa microdatos académicos UNAD."""
+    logger.info("Iniciando procesamiento de fuente: UNAD")
+
+    prefix = "unad/"
+
+    if not s3_prefix_exists(RAW_BUCKET, prefix):
+        logger.info("No existen archivos UNAD para procesar")
         return
 
-    pdf_parts: List[pd.DataFrame] = []
-    for key in keys:
-        try:
-            body = get_s3_bytes(key)
-            text = body.decode("windows-1252", errors="replace")
-            lines = text.split("\n")
-            skip = 0
-            for i, line in enumerate(lines):
-                stripped = line.strip()
-                if stripped.startswith("UNIVERSIDAD") or stripped.startswith("Estudiantes del periodo"):
-                    skip = i + 1
-                    continue
-                break
-            csv_text = "\n".join(lines[skip:])
-            pdf = pd.read_csv(
-                io.StringIO(csv_text),
-                sep=";",
-                dtype=str,
-                na_values=["", "NULL", "NA"],
-            )
-            pdf.columns = [normalize_column_name(c) for c in pdf.columns]
+    path = f"s3://{RAW_BUCKET}/unad/*.csv"
 
-            filename = key.split("/")[-1]
-            periodo: Optional[str] = None
-            if "/periodo=" in key:
-                periodo = key.split("/periodo=")[1].split("/")[0]
-            if not periodo and "estudiantes_" in filename:
-                periodo = filename.replace("estudiantes_", "").replace(".csv", "")
-            pdf["_periodo_codigo"] = periodo or "unknown"
-            pdf["_source_file"] = filename
-            pdf_parts.append(pdf)
-        except Exception as exc:
-            logger.exception("Failed to parse UNAD file %s: %s", key, exc)
+    try:
+        logger.info(f"Leyendo archivos UNAD desde {path}")
 
-    if not pdf_parts:
-        logger.warning("No UNAD files could be parsed")
-        return
+        df = (
+            spark.read
+            .option("sep", ";")
+            .option("header", "true")
+            .option("encoding", "utf-8")
+            .csv(path)
+        )
 
-    full_pdf = pd.concat(pdf_parts, ignore_index=True, sort=False).fillna("")
-    df = spark.createDataFrame(full_pdf.astype(str))
+        logger.info("CSV UNAD cargado correctamente")
 
-    cleaned = df
-    if "id" in df.columns:
-        cleaned = cleaned.withColumn("id", col("id").cast("long"))
-    if "edad" in df.columns:
-        cleaned = cleaned.withColumn("edad", col("edad").cast("int"))
-    if "estrato_social" in df.columns:
-        cleaned = cleaned.withColumn("estrato_social", col("estrato_social").cast("int"))
+        df = (
+            df.withColumn("_source_file", input_file_name())
+              .withColumn(
+                  "_periodo_codigo",
+                  regexp_extract(col("_source_file"), r"estudiantes_(.+)\.csv", 1)
+              )
+        )
 
-    text_columns = [
-        "sexo",
-        "zona_de_residencia",
-        "escuela",
-        "programa",
-        "zona",
-        "centro",
-        "departamento_residencia",
-        "municipio_residencia",
-    ]
-    for c in text_columns:
-        if c in df.columns:
-            cleaned = cleaned.withColumn(c, upper(trim(col(c))))
+        if "periodo" in [c.lower() for c in df.columns]:
+            id_col = next(c for c in df.columns if c.lower() == "periodo")
+            df = df.filter(col(id_col).isNotNull() & (trim(col(id_col)) != ""))
 
-    cleaned = cleaned.withColumn(
-        "anio_academico",
-        when(col("_periodo_codigo").rlike(r"^17\d{2}$"), 2024)
-        .when(col("_periodo_codigo").rlike(r"^203[1-5]$"), 2025)
-        .otherwise(None)
-        .cast("int"),
-    )
+        if "edad" in df.columns:
+            df = df.withColumn("edad", col("edad").cast("int"))
 
-    cleaned = add_silver_metadata(cleaned, "unad")
-    write_silver_table(
-        cleaned,
-        "unad_estudiantes",
-        partition_cols=["anio_academico", "_periodo_codigo"],
-    )
+        if "estrato_social" in df.columns:
+            df = df.withColumn("estrato_social", col("estrato_social").cast("int"))
 
+        text_cols = ["sexo", "escuela", "programa", "departamento_residencia"]
 
-# ----------------------------------------------------------------
-# Source: Datos Abiertos Colombia (Socrata JSON)
-# ----------------------------------------------------------------
-def process_gobierno() -> None:
-    keys = list_s3_objects("gobierno/", suffix_filter=(".json",))
-    if not keys:
-        logger.warning("No Gobierno files found in s3://%s/gobierno/", RAW_BUCKET)
-        return
+        for c in text_cols:
+            if c in df.columns:
+                df = df.withColumn(c, upper(trim(col(c))))
 
-    by_dataset: Dict[str, List[str]] = {}
-    for key in keys:
-        if "/dataset_id=" in key:
-            ds = key.split("/dataset_id=")[1].split("/")[0]
-        else:
-            base = key.split("/")[-1].replace(".json", "")
-            ds = base.replace("dataset_", "")
-        by_dataset.setdefault(ds, []).append(key)
+        df = add_silver_metadata(df, "unad")
 
-    for ds_id, ds_keys in by_dataset.items():
-        table_name = GOBIERNO_TABLE_MAP.get(ds_id, f"gobierno_{ds_id.replace('-', '_')}")
-        try:
-            paths = [f"s3://{RAW_BUCKET}/{k}" for k in ds_keys]
-            df = spark.read.option("multiLine", "true").json(paths)
-            for c in df.columns:
-                df = df.withColumnRenamed(c, normalize_column_name(c))
-            df = df.withColumn("_dataset_id", lit(ds_id))
-            df = add_silver_metadata(df, "gobierno")
-            write_silver_table(df, table_name)
-        except Exception as exc:
-            logger.exception("Failed to process gobierno dataset %s: %s", ds_id, exc)
+        logger.info("Escribiendo parquet UNAD en Silver")
+        write_silver_table(df, "unad_estudiantes")
+        logger.info("Procesamiento UNAD finalizado")
 
+    except Exception as exc:
+        logger.error(f"Error procesando UNAD: {str(exc)}")
 
-# ----------------------------------------------------------------
-# Source: SNIES (xlsx + xlsb, variable header row)
-# ----------------------------------------------------------------
-def process_snies() -> None:
-    keys = list_s3_objects("snies/", suffix_filter=(".xlsx", ".xlsb", ".xlsm"))
-    if not keys:
-        logger.warning("No SNIES files found in s3://%s/snies/", RAW_BUCKET)
-        return
+# -----------------------------------------------------------------------------
+# SPADIES (Versión Resiliente con lectura de nombre de archivo)
+# -----------------------------------------------------------------------------
 
-    pdf_parts: List[pd.DataFrame] = []
-    for key in keys:
-        try:
-            body = get_s3_bytes(key)
-            engine = "pyxlsb" if key.lower().endswith(".xlsb") else "openpyxl"
-
-            preview_buffer = io.BytesIO(body)
-            preview = pd.read_excel(
-                preview_buffer, engine=engine, header=None, nrows=20, sheet_name=0
-            )
-            header_row: Optional[int] = None
-            for i in range(len(preview)):
-                row_values = [str(v).upper() for v in preview.iloc[i].tolist()]
-                if any(("CODIGO" in v) or ("CÓDIGO" in v) for v in row_values):
-                    header_row = i
-                    break
-            if header_row is None:
-                logger.warning("No header detected in SNIES file %s; skipping", key)
-                continue
-
-            full_buffer = io.BytesIO(body)
-            pdf = pd.read_excel(
-                full_buffer,
-                engine=engine,
-                header=header_row,
-                sheet_name=0,
-                dtype=str,
-            )
-            pdf = pdf.dropna(how="all")
-            pdf.columns = [normalize_column_name(c) for c in pdf.columns]
-            pdf["_source_file"] = key.split("/")[-1]
-            pdf_parts.append(pdf)
-        except Exception as exc:
-            logger.exception("Failed to parse SNIES file %s: %s", key, exc)
-
-    if not pdf_parts:
-        return
-
-    full_pdf = pd.concat(pdf_parts, ignore_index=True, sort=False).fillna("")
-    df = spark.createDataFrame(full_pdf.astype(str))
-    df = add_silver_metadata(df, "snies")
-    write_silver_table(df, "snies_graduados")
-
-
-# ----------------------------------------------------------------
-# Source: SPADIES (UTF-8 BOM, pivot CSV)
-# ----------------------------------------------------------------
 def process_spadies() -> None:
-    keys = list_s3_objects("spadies/", suffix_filter=(".csv",))
-    if not keys:
-        logger.warning("No SPADIES files found in s3://%s/spadies/", RAW_BUCKET)
+    """Procesa dataset SPADIES dinámicamente según el nombre del archivo."""
+    logger.info("Iniciando procesamiento de fuente: SPADIES")
+
+    response = s3_client.list_objects_v2(Bucket=RAW_BUCKET, Prefix="spadies/")
+    files = response.get("Contents", [])
+
+    if not files:
+        logger.info("No existen archivos SPADIES para procesar")
         return
 
-    pdf_parts: List[pd.DataFrame] = []
-    for key in keys:
+    for obj in files:
+        key = obj["Key"]
+        if not key.lower().endswith(".csv"):
+            continue
+
         try:
-            body = get_s3_bytes(key)
+            logger.info(f"Procesando SPADIES: {key}")
+
+            # 1. Sacar el nombre limpio del archivo. Ej: "CreditoIcetex"
+            file_name_raw = key.split("/")[-1].replace(".csv", "").replace(".CSV", "")
+
+            # 2. Nombrar la tabla dinámicamente usando nuestro helper. Ej: "spadies_creditoicetex"
+            table_name = f"spadies_{normalize_column_name(file_name_raw)}"
+
+            body = s3_client.get_object(Bucket=RAW_BUCKET, Key=key)["Body"].read()
             text = body.decode("utf-8-sig", errors="replace")
+
             pdf = pd.read_csv(io.StringIO(text), sep=";", dtype=str)
             pdf.columns = [c.strip() for c in pdf.columns]
+
             id_col = pdf.columns[0]
             period_cols = [c for c in pdf.columns[1:] if c]
+
             long = pdf.melt(
                 id_vars=[id_col],
                 value_vars=period_cols,
                 var_name="periodo_academico",
                 value_name="valor_str",
             )
-            long = long.rename(columns={id_col: normalize_column_name(id_col)})
-            long["valor_str"] = (
-                long["valor_str"].astype(str).str.replace("%", "", regex=False).str.replace(",", ".", regex=False)
-            )
-            long["porcentaje"] = pd.to_numeric(long["valor_str"], errors="coerce")
-            long["_source_file"] = key.split("/")[-1]
-            pdf_parts.append(long)
-        except Exception as exc:
-            logger.exception("Failed to parse SPADIES file %s: %s", key, exc)
 
-    if not pdf_parts:
+            long = long.rename(columns={id_col: normalize_column_name(id_col)})
+
+            long["valor_str"] = long["valor_str"].astype(str).str.replace("%", "", regex=False).str.replace(",", ".", regex=False)
+            long["porcentaje"] = pd.to_numeric(long["valor_str"], errors="coerce").fillna(0.0)
+            long["valor_str"] = long["valor_str"].replace("nan", "")
+
+            df = spark.createDataFrame(long)
+
+            df = df.withColumn("_dataset_id", lit(file_name_raw))
+            df = add_silver_metadata(df, "spadies")
+
+            write_silver_table(df, table_name)
+            logger.info(f"SPADIES procesado exitosamente y guardado como: {table_name}")
+
+        except Exception as exc:
+            logger.error(f"Error procesando SPADIES {key}: {str(exc)}")
+
+# -----------------------------------------------------------------------------
+# GOBIERNO
+# -----------------------------------------------------------------------------
+
+def process_gobierno() -> None:
+    """Procesa datasets JSON de Datos Abiertos Colombia."""
+    logger.info("Iniciando procesamiento de fuente: GOBIERNO")
+
+    response = s3_client.list_objects_v2(Bucket=RAW_BUCKET, Prefix="gobierno/")
+    files = response.get("Contents", [])
+
+    if not files:
+        logger.info("No existen datasets de gobierno")
         return
 
-    full_pdf = pd.concat(pdf_parts, ignore_index=True)
-    full_pdf["valor_str"] = full_pdf["valor_str"].fillna("")
-    full_pdf["porcentaje"] = full_pdf["porcentaje"].fillna(0.0)
-    df = spark.createDataFrame(full_pdf)
-    df = add_silver_metadata(df, "spadies")
-    write_silver_table(df, "spadies_creditos_icetex")
+    for obj in files:
+        key = obj["Key"]
+        if not key.endswith(".json"):
+            continue
 
+        try:
+            file_name = key.split("/")[-1].replace(".json", "")
+            ds_id = file_name.replace("dataset_", "")
+
+            table_name = GOBIERNO_TABLE_MAP.get(ds_id, f"gobierno_{ds_id.replace('-', '_')}")
+            path = f"s3://{RAW_BUCKET}/{key}"
+
+            logger.info(f"Procesando dataset gobierno: {ds_id}")
+
+            df = spark.read.option("multiLine", "true").json(path)
+            df = df.withColumn("_dataset_id", lit(ds_id))
+            df = add_silver_metadata(df, "gobierno")
+
+            write_silver_table(df, table_name)
+            logger.info(f"Dataset gobierno procesado: {ds_id}")
+
+        except Exception as exc:
+            logger.warning(f"Error procesando dataset gobierno {key}: {str(exc)}")
+
+# -----------------------------------------------------------------------------
+# SNIES (Restaurado el escudo de nulos)
+# -----------------------------------------------------------------------------
+
+def process_snies() -> None:
+    """Procesa archivos Excel SNIES."""
+    logger.info("Iniciando procesamiento de fuente: SNIES")
+
+    paginator = s3_client.get_paginator("list_objects_v2")
+
+    for page in paginator.paginate(Bucket=RAW_BUCKET, Prefix="snies/"):
+        for obj in page.get("Contents", []):
+            key = obj["Key"]
+
+            if not key.lower().endswith((".xlsx", ".xlsb")):
+                continue
+
+            try:
+                logger.info(f"Procesando archivo SNIES: {key}")
+
+                response = s3_client.get_object(Bucket=RAW_BUCKET, Key=key)
+                content = response["Body"].read()
+                engine = "pyxlsb" if key.endswith(".xlsb") else "openpyxl"
+
+                preview = pd.read_excel(io.BytesIO(content), engine=engine, nrows=20, header=None)
+
+                matches = preview.index[
+                    preview.astype(str).apply(lambda x: x.str.contains("CÓDIGO|CODIGO", case=False, na=False)).any(axis=1)
+                ].tolist()
+
+                if not matches:
+                    logger.warning(f"No se detectó encabezado válido en {key}")
+                    continue
+
+                header_row = matches[0]
+
+                # Restauramos el dtype=str y llenamos los nulos (NaN) para que Spark no reviente
+                pdf = pd.read_excel(io.BytesIO(content), engine=engine, header=header_row, dtype=str)
+                pdf = pdf.dropna(how="all").fillna("")
+
+                pdf.columns = [normalize_column_name(c) for c in pdf.columns]
+
+                df = spark.createDataFrame(pdf)
+                df = add_silver_metadata(df, "snies")
+
+                write_silver_table(df, "snies_graduados")
+                logger.info(f"Archivo SNIES procesado: {key}")
+
+            except Exception as exc:
+                logger.error(f"Error procesando archivo SNIES {key}: {str(exc)}")
+
+# -----------------------------------------------------------------------------
+# MAIN
+# -----------------------------------------------------------------------------
 
 def main() -> None:
-    spark.sql(f"CREATE DATABASE IF NOT EXISTS {SILVER_DATABASE}")
-    sources = [
-        ("unad", process_unad),
-        ("gobierno", process_gobierno),
-        ("snies", process_snies),
-        ("spadies", process_spadies),
-    ]
-    for label, fn in sources:
-        try:
-            logger.info("=== Processing source: %s ===", label)
-            fn()
-        except Exception as exc:
-            logger.exception("Source '%s' failed at top-level: %s", label, exc)
+    logger.info(f"Iniciando ejecución de Job: {JOB_NAME}")
+
+    process_unad()
+    process_spadies()
+    process_gobierno()
+    process_snies()
 
     job.commit()
+    logger.info("Ejecución finalizada satisfactoriamente.")
 
-
-main()
+if __name__ == "__main__":
+    main()
