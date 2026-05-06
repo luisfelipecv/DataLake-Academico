@@ -116,12 +116,7 @@ def _fetch_page(
 
 
 def _build_chunk_key(dataset_id: str, extracted_at_iso: str, page: int) -> str:
-    date_part = extracted_at_iso[:10]
-    yyyy, mm, dd = date_part.split("-")
-    return (
-        f"gobierno/dataset_id={dataset_id}/extracted_at={date_part}/"
-        f"year={yyyy}/month={mm}/day={dd}/part-{page:07d}.json"
-    )
+    return f"gobierno/{dataset_id}.json"
 
 
 def _upload_chunk(records: List[dict], dataset_id: str, extracted_at_iso: str, page: int) -> str:
