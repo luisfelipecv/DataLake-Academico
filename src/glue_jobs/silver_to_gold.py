@@ -1,27 +1,3 @@
-"""
-Glue PySpark job: Silver -> Gold.
-
-Materializes the analytical-ready Gold layer used by Athena (EDA),
-the App Runner dashboards and the SageMaker training pipeline.
-
-Tables produced
----------------
-- fact_estudiante_periodo
-    UNAD microdata at (id, periodo) granularity, enriched with the
-    chronological period ordering and a binary `desertion_t1` target
-    computed via window over the per-student timeline.
-- dim_gobierno_municipio
-    Sisbén IV vulnerability (% group D per municipality) and MinTIC
-    fixed-internet access aggregated at the municipality level.
-- dim_gobierno_cobertura_dpto
-    MEN coverage / dropout / pass-rate metrics at the department level.
-- dim_snies_graduados_programa
-    Total graduates per academic program (proxy for program throughput).
-- dim_spadies_creditos_periodo
-    ICETEX credit-type distribution by period, already unpivoted in Silver.
-
-Per-table failures are logged but never abort the rest of the pipeline.
-"""
 import logging
 import sys
 from datetime import datetime
@@ -33,292 +9,126 @@ from awsglue.utils import getResolvedOptions
 from pyspark.context import SparkContext
 from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql.functions import (
-    broadcast,
-    col,
-    count,
-    countDistinct,
-    current_timestamp,
-    lead,
-    lit,
-    regexp_replace,
-    sum as spark_sum,
-    trim,
-    upper,
-    when,
+    broadcast, col, current_timestamp, lead, lit, when, count, avg, upper, trim
 )
 from pyspark.sql.window import Window
 
-ARG_NAMES = [
-    "JOB_NAME",
-    "SILVER_BUCKET",
-    "GOLD_BUCKET",
-    "SILVER_DATABASE",
-    "GOLD_DATABASE",
-    "PROJECT_NAME",
-    "ENVIRONMENT",
-]
-args = getResolvedOptions(sys.argv, ARG_NAMES)
-SILVER_BUCKET = args["SILVER_BUCKET"]
-GOLD_BUCKET = args["GOLD_BUCKET"]
+# Configuración de argumentos
+args = getResolvedOptions(sys.argv, ["JOB_NAME", "SILVER_DATABASE", "GOLD_DATABASE", "GOLD_BUCKET"])
 SILVER_DATABASE = args["SILVER_DATABASE"]
 GOLD_DATABASE = args["GOLD_DATABASE"]
-PROJECT_NAME = args["PROJECT_NAME"]
-ENVIRONMENT = args["ENVIRONMENT"]
+GOLD_BUCKET = args["GOLD_BUCKET"]
 JOB_NAME = args["JOB_NAME"]
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(name)s - %(message)s",
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s - %(message)s")
 logger = logging.getLogger("silver_to_gold")
 
 sc = SparkContext.getOrCreate()
 glue_context = GlueContext(sc)
-spark: SparkSession = glue_context.spark_session
-spark.conf.set("spark.sql.legacy.allowNonEmptyLocationInCTAS", "true")
-spark.conf.set("spark.sql.sources.partitionOverwriteMode", "dynamic")
+spark = glue_context.spark_session
 
 job = Job(glue_context)
 job.init(JOB_NAME, args)
 
 RUN_ID = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
 
-# (periodo_codigo, anio, semestre, periodo_orden) — orden chronological global
-PERIOD_ORDER = [
-    ("1701", 2024, 1, 1),
-    ("1702", 2024, 2, 2),
-    ("1703", 2024, 3, 3),
-    ("1704", 2024, 4, 4),
-    ("1705", 2024, 5, 5),
-    ("2031", 2025, 1, 6),
-    ("2032", 2025, 2, 7),
-    ("2033", 2025, 3, 8),
-    ("2034", 2025, 4, 9),
-    ("2035", 2025, 5, 10),
-]
-
-
-def safe_silver_table(name: str) -> Optional[DataFrame]:
+def safe_spark_table(db: str, table: str) -> Optional[DataFrame]:
     try:
-        return spark.table(f"{SILVER_DATABASE}.{name}")
-    except Exception as exc:
-        logger.warning("Silver table not available: %s.%s (%s)", SILVER_DATABASE, name, exc)
+        return spark.table(f"{db}.{table}")
+    except Exception:
+        logger.warning(f"No se pudo cargar la tabla {db}.{table}")
         return None
 
-
-def normalize_text(c):
-    return upper(trim(regexp_replace(c, r"\s+", " ")))
-
-
-def add_gold_metadata(df: DataFrame, source: str) -> DataFrame:
-    return (
-        df.withColumn("_gold_source", lit(source))
-        .withColumn("_gold_processed_at", current_timestamp())
-        .withColumn("_gold_run_id", lit(RUN_ID))
-    )
-
-
-def write_gold(df: DataFrame, table_name: str, partition_cols: Optional[List[str]] = None) -> None:
+def write_gold_clean(df: DataFrame, table_name: str, partition_cols: Optional[List[str]] = None) -> None:
+    """Escribe en S3 y registra en Glue con nombres limpios."""
     output_path = f"s3://{GOLD_BUCKET}/{table_name}/"
-    writer = (
-        df.write.mode("overwrite")
-        .format("parquet")
-        .option("compression", "snappy")
-        .option("path", output_path)
-    )
+    spark.sql(f"DROP TABLE IF EXISTS {GOLD_DATABASE}.{table_name}")
+
+    df_final = df.withColumn("_gold_processed_at", current_timestamp()) \
+                 .withColumn("_gold_run_id", lit(RUN_ID))
+
+    writer = df_final.write.mode("overwrite").format("parquet").option("path", output_path)
     if partition_cols:
         writer = writer.partitionBy(*partition_cols)
+
     writer.saveAsTable(f"{GOLD_DATABASE}.{table_name}")
-    logger.info("Wrote gold table %s.%s -> %s", GOLD_DATABASE, table_name, output_path)
+    logger.info(f"Escritura finalizada: {table_name}")
 
+# --- 1. CAPA RAW GOLD (Copia exacta de Silver para auditoría) ---
+def build_raw_gold_layers():
+    logger.info("Generando copias Raw en Gold...")
+    tables = {
+        "snies_graduados": "dim_raw_snies_graduados",
+        "spadies_creditoicetex": "dim_raw_spadies_creditos",
+        "gobierno_sisben_iv": "dim_raw_gobierno_sisben",
+        "gobierno_internet_fijo": "dim_raw_gobierno_internet"
+    }
+    for silver_name, gold_name in tables.items():
+        df = safe_spark_table(SILVER_DATABASE, silver_name)
+        if df:
+            write_gold_clean(df, gold_name)
 
-# ----------------------------------------------------------------
-# fact_estudiante_periodo (target deserción)
-# ----------------------------------------------------------------
-def build_fact_estudiante_periodo() -> None:
-    unad = safe_silver_table("unad_estudiantes")
-    if unad is None:
-        logger.error("Cannot build fact_estudiante_periodo: silver UNAD missing")
+# --- 2. CAPA ANALYTICAL GOLD (La "verdad" para el modelo) ---
+def build_analytical_gold():
+    logger.info("Construyendo tabla de hechos enriquecida...")
+
+    unad = safe_spark_table(SILVER_DATABASE, "unad_estudiantes")
+    sisben = safe_spark_table(SILVER_DATABASE, "gobierno_sisben_iv")
+    mintic = safe_spark_table(SILVER_DATABASE, "gobierno_internet_fijo")
+
+    if not (unad and sisben and mintic):
+        logger.error("Faltan tablas esenciales para el cruce.")
         return
-    if "id" not in unad.columns:
-        logger.error("UNAD silver lacks 'id' column; cannot build fact_estudiante_periodo")
-        return
 
-    period_df = spark.createDataFrame(
-        PERIOD_ORDER,
-        schema="periodo_codigo string, anio int, semestre int, periodo_orden int",
+    # A. Crear Diccionario de Municipios (Nombre -> Código)
+    # Usamos MinTIC que tiene ambos campos
+    municipio_ref = mintic.select(
+        upper(trim(col("municipio"))).alias("nombre_mpio_ref"),
+        col("cod_municipio").alias("codigo_divipola")
+    ).distinct()
+
+    # B. Agregación de Sisbén (Promedios de pobreza por municipio)
+    # Incluimos las variables de privación que pediste para el modelo
+    sisben_metrics = sisben.groupBy("cod_mpio").agg(
+        avg("i8").alias("tasa_informalidad_mpio"),     # I8: Trabajo informal
+        avg("i15").alias("tasa_hacinamiento_mpio"),   # I15: Hacinamiento
+        avg("h_5").alias("promedio_ipm_mpio"),         # H_5: Pobreza multidimensional
+        count("*").alias("poblacion_sisben_mpio")
     )
 
-    enriched = (
-        unad.withColumnRenamed("_periodo_codigo", "periodo_codigo")
-        .join(broadcast(period_df), on="periodo_codigo", how="left")
-    )
+    # C. Lógica de Deserción UNAD
+    periods = spark.createDataFrame([
+        ("1701", 2024, 1, 1), ("1702", 2024, 2, 2), ("1703", 2024, 3, 3), ("1704", 2024, 4, 4), ("1705", 2024, 5, 5),
+        ("2031", 2025, 1, 6), ("2032", 2025, 2, 7), ("2033", 2025, 3, 8), ("2034", 2025, 4, 9), ("2035", 2025, 5, 10)
+    ], schema="periodo_codigo string, anio int, semestre int, periodo_orden int")
+
+    fact = unad.withColumnRenamed("_periodo_codigo", "periodo_codigo") \
+               .join(broadcast(periods), on="periodo_codigo", how="left")
 
     w = Window.partitionBy("id").orderBy("periodo_orden")
-    fact = enriched.withColumn("next_periodo_orden", lead("periodo_orden").over(w)).withColumn(
-        "desertion_t1",
-        when(col("periodo_orden") >= lit(10), lit(None).cast("int"))
-        .when(col("next_periodo_orden").isNull(), lit(1).cast("int"))
-        .when(col("next_periodo_orden") > col("periodo_orden") + lit(1), lit(1).cast("int"))
-        .otherwise(lit(0).cast("int")),
-    )
+    fact = fact.withColumn("next_periodo_orden", lead("periodo_orden").over(w)) \
+               .withColumn("desertion_t1",
+                    when(col("periodo_orden") >= 10, lit(None).cast("int"))
+                    .when(col("next_periodo_orden").isNull() | (col("next_periodo_orden") > col("periodo_orden") + 1), 1)
+                    .otherwise(0))
 
-    if "municipio_residencia" in fact.columns:
-        fact = fact.withColumn(
-            "municipio_residencia_norm", normalize_text(col("municipio_residencia"))
-        )
-    if "departamento_residencia" in fact.columns:
-        fact = fact.withColumn(
-            "departamento_residencia_norm", normalize_text(col("departamento_residencia"))
-        )
+    # D. EL CRUCE MAESTRO (Traducción y Enriquecimiento)
+    # 1. Normalizamos nombre en UNAD
+    fact_clean = fact.withColumn("mpio_norm", upper(trim(col("municipio_residencia"))))
 
-    fact = add_gold_metadata(fact, "unad")
-    write_gold(fact, "fact_estudiante_periodo", partition_cols=["anio"])
+    # 2. Pegamos Código DIVIPOLA
+    fact_with_code = fact_clean.join(broadcast(municipio_ref), fact_clean.mpio_norm == municipio_ref.nombre_mpio_ref, "left")
 
+    # 3. Pegamos métricas del Sisbén
+    fact_final = fact_with_code.join(broadcast(sisben_metrics), fact_with_code.codigo_divipola == sisben_metrics.cod_mpio, "left")
 
-# ----------------------------------------------------------------
-# dim_gobierno_municipio (Sisbén + MinTIC)
-# ----------------------------------------------------------------
-def build_dim_gobierno_municipio() -> None:
-    sisben = safe_silver_table("gobierno_sisben_iv")
-    mintic = safe_silver_table("gobierno_internet_fijo")
+    write_gold_clean(fact_final, "fact_estudiante_periodo", partition_cols=["anio"])
 
-    if sisben is None and mintic is None:
-        logger.warning("No gobierno sources available for dim_gobierno_municipio")
-        return
-
-    sisben_agg: Optional[DataFrame] = None
-    if sisben is not None and {"cod_mpio", "grupo"}.issubset(set(sisben.columns)):
-        sisben_agg = (
-            sisben.filter(col("cod_mpio").isNotNull())
-            .groupBy(col("cod_mpio").alias("cod_municipio"))
-            .agg(
-                count("*").alias("sisben_total_registros"),
-                spark_sum(when(col("grupo") == "A", 1).otherwise(0)).alias("sisben_grupo_a_count"),
-                spark_sum(when(col("grupo") == "B", 1).otherwise(0)).alias("sisben_grupo_b_count"),
-                spark_sum(when(col("grupo") == "C", 1).otherwise(0)).alias("sisben_grupo_c_count"),
-                spark_sum(when(col("grupo") == "D", 1).otherwise(0)).alias("sisben_grupo_d_count"),
-            )
-            .withColumn(
-                "sisben_pct_grupo_d",
-                when(
-                    col("sisben_total_registros") > 0,
-                    col("sisben_grupo_d_count") / col("sisben_total_registros"),
-                ).otherwise(lit(0.0)),
-            )
-        )
-
-    mintic_agg: Optional[DataFrame] = None
-    if mintic is not None and "cod_municipio" in mintic.columns:
-        mintic_agg = (
-            mintic.filter(col("cod_municipio").isNotNull())
-            .groupBy("cod_municipio")
-            .agg(
-                spark_sum(col("no_de_accesos").cast("long")).alias("mintic_total_accesos"),
-                countDistinct("proveedor").alias("mintic_distinct_proveedores"),
-                countDistinct("tecnologia").alias("mintic_distinct_tecnologias"),
-            )
-        )
-
-    if sisben_agg is not None and mintic_agg is not None:
-        df = sisben_agg.join(mintic_agg, on="cod_municipio", how="outer")
-    elif sisben_agg is not None:
-        df = sisben_agg
-    elif mintic_agg is not None:
-        df = mintic_agg
-    else:
-        logger.warning("Neither Sisbén nor MinTIC produced an aggregate; skipping dim_gobierno_municipio")
-        return
-
-    df = add_gold_metadata(df, "gobierno")
-    write_gold(df, "dim_gobierno_municipio")
-
-
-# ----------------------------------------------------------------
-# dim_gobierno_cobertura_dpto
-# ----------------------------------------------------------------
-def build_dim_gobierno_cobertura_dpto() -> None:
-    cob = safe_silver_table("gobierno_cobertura_educativa")
-    if cob is None:
-        return
-    if not {"ano", "departamento"}.issubset(set(cob.columns)):
-        logger.warning("cobertura_educativa silver missing required columns; skipping")
-        return
-
-    out = cob.select(
-        col("ano").cast("int").alias("anio"),
-        col("departamento"),
-        normalize_text(col("departamento")).alias("departamento_norm"),
-        col("cobertura_neta").cast("double").alias("cobertura_neta"),
-        col("cobertura_bruta").cast("double").alias("cobertura_bruta"),
-        col("desercion").cast("double").alias("desercion_basica"),
-        col("aprobacion").cast("double").alias("aprobacion_basica"),
-        col("reprobacion").cast("double").alias("reprobacion_basica"),
-    )
-    out = add_gold_metadata(out, "cobertura")
-    write_gold(out, "dim_gobierno_cobertura_dpto", partition_cols=["anio"])
-
-
-# ----------------------------------------------------------------
-# dim_snies_graduados_programa
-# ----------------------------------------------------------------
-def build_dim_snies_graduados_programa() -> None:
-    snies = safe_silver_table("snies_graduados")
-    if snies is None:
-        return
-
-    program_col = None
-    for cand in [
-        "programa_academico",
-        "programa_acad_mico",
-        "programa",
-        "programa_de_formaci_n",
-    ]:
-        if cand in snies.columns:
-            program_col = cand
-            break
-    if not program_col:
-        logger.warning("Could not detect 'programa' column in snies_graduados; skipping dim_snies")
-        return
-
-    out = (
-        snies.filter(col(program_col).isNotNull())
-        .groupBy(col(program_col).alias("programa"))
-        .agg(count("*").alias("snies_graduados_total"))
-        .withColumn("programa_norm", normalize_text(col("programa")))
-    )
-    out = add_gold_metadata(out, "snies")
-    write_gold(out, "dim_snies_graduados_programa")
-
-
-# ----------------------------------------------------------------
-# dim_spadies_creditos_periodo
-# ----------------------------------------------------------------
-def build_dim_spadies_creditos_periodo() -> None:
-    spd = safe_silver_table("spadies_creditos_icetex")
-    if spd is None:
-        return
-    out = add_gold_metadata(spd, "spadies")
-    write_gold(out, "dim_spadies_creditos_periodo")
-
-
-def main() -> None:
+def main():
     spark.sql(f"CREATE DATABASE IF NOT EXISTS {GOLD_DATABASE}")
-    builders = [
-        ("fact_estudiante_periodo", build_fact_estudiante_periodo),
-        ("dim_gobierno_municipio", build_dim_gobierno_municipio),
-        ("dim_gobierno_cobertura_dpto", build_dim_gobierno_cobertura_dpto),
-        ("dim_snies_graduados_programa", build_dim_snies_graduados_programa),
-        ("dim_spadies_creditos_periodo", build_dim_spadies_creditos_periodo),
-    ]
-    for name, fn in builders:
-        try:
-            logger.info("=== Building gold: %s ===", name)
-            fn()
-        except Exception as exc:
-            logger.exception("Failed to build %s: %s", name, exc)
-
+    build_raw_gold_layers()
+    build_analytical_gold()
     job.commit()
 
-
-main()
+if __name__ == "__main__":
+    main()
