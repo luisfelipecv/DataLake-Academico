@@ -1,3 +1,11 @@
+"""
+PROYECTO: Data Lake Académico
+MÓDULO: silver_to_gold.py
+DESCRIPCIÓN: Materialización de la capa Gold (Analítica).
+            Enriquece microdatos de la UNAD con variables socioeconómicas del Sisbén
+            y conectividad de MinTIC para el modelo de predicción de deserción.
+"""
+
 import logging
 import sys
 from datetime import datetime
@@ -13,7 +21,9 @@ from pyspark.sql.functions import (
 )
 from pyspark.sql.window import Window
 
-# Configuración de argumentos
+# -----------------------------------------------------------------------------
+# CONFIGURACIÓN DE ARGUMENTOS
+# -----------------------------------------------------------------------------
 args = getResolvedOptions(sys.argv, ["JOB_NAME", "SILVER_DATABASE", "GOLD_DATABASE", "GOLD_BUCKET"])
 SILVER_DATABASE = args["SILVER_DATABASE"]
 GOLD_DATABASE = args["GOLD_DATABASE"]
@@ -32,7 +42,11 @@ job.init(JOB_NAME, args)
 
 RUN_ID = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
 
+# -----------------------------------------------------------------------------
+# FUNCIONES UTILITARIAS
+# -----------------------------------------------------------------------------
 def safe_spark_table(db: str, table: str) -> Optional[DataFrame]:
+    """Carga una tabla de Glue de forma segura."""
     try:
         return spark.table(f"{db}.{table}")
     except Exception:
@@ -40,10 +54,13 @@ def safe_spark_table(db: str, table: str) -> Optional[DataFrame]:
         return None
 
 def write_gold_clean(df: DataFrame, table_name: str, partition_cols: Optional[List[str]] = None) -> None:
-    """Escribe en S3 y registra en Glue con nombres limpios."""
+    """Escribe en S3 en formato Parquet y registra la tabla en el catálogo de Glue."""
     output_path = f"s3://{GOLD_BUCKET}/{table_name}/"
+
+    # Limpieza del catálogo para evitar duplicados o hashes
     spark.sql(f"DROP TABLE IF EXISTS {GOLD_DATABASE}.{table_name}")
 
+    # Auditoría técnica
     df_final = df.withColumn("_gold_processed_at", current_timestamp()) \
                  .withColumn("_gold_run_id", lit(RUN_ID))
 
@@ -52,11 +69,14 @@ def write_gold_clean(df: DataFrame, table_name: str, partition_cols: Optional[Li
         writer = writer.partitionBy(*partition_cols)
 
     writer.saveAsTable(f"{GOLD_DATABASE}.{table_name}")
-    logger.info(f"Escritura finalizada: {table_name}")
+    logger.info(f"Tabla Gold materializada: {table_name}")
 
-# --- 1. CAPA RAW GOLD (Copia exacta de Silver para auditoría) ---
+# -----------------------------------------------------------------------------
+# 1. CAPA RAW GOLD (Espejo de Silver para Auditoría)
+# -----------------------------------------------------------------------------
 def build_raw_gold_layers():
-    logger.info("Generando copias Raw en Gold...")
+    """Mantiene versiones íntegras de las dimensiones originales en Gold."""
+    logger.info("Generando capas Raw Gold para auditoría y BI...")
     tables = {
         "snies_graduados": "dim_raw_snies_graduados",
         "spadies_creditoicetex": "dim_raw_spadies_creditos",
@@ -68,67 +88,91 @@ def build_raw_gold_layers():
         if df:
             write_gold_clean(df, gold_name)
 
-# --- 2. CAPA ANALYTICAL GOLD (La "verdad" para el modelo) ---
+# -----------------------------------------------------------------------------
+# 2. CAPA ANALYTICAL GOLD (Consolidado para Modelado de Datos)
+# -----------------------------------------------------------------------------
 def build_analytical_gold():
-    logger.info("Construyendo tabla de hechos enriquecida...")
+    """Crea la tabla maestra enriquecida para el modelo de Machine Learning."""
+    logger.info("Construyendo fact_estudiante_periodo enriquecida...")
 
     unad = safe_spark_table(SILVER_DATABASE, "unad_estudiantes")
     sisben = safe_spark_table(SILVER_DATABASE, "gobierno_sisben_iv")
     mintic = safe_spark_table(SILVER_DATABASE, "gobierno_internet_fijo")
 
     if not (unad and sisben and mintic):
-        logger.error("Faltan tablas esenciales para el cruce.")
+        logger.error("Faltan fuentes en Silver para completar el enriquecimiento.")
         return
 
-    # A. Crear Diccionario de Municipios (Nombre -> Código)
-    # Usamos MinTIC que tiene ambos campos
+    # A. TRADUCTOR DE MUNICIPIOS (Mapeo Nombre -> Código DIVIPOLA)
+    # Requerido porque UNAD viene por nombre y Sisbén por código.
     municipio_ref = mintic.select(
         upper(trim(col("municipio"))).alias("nombre_mpio_ref"),
         col("cod_municipio").alias("codigo_divipola")
     ).distinct()
 
-    # B. Agregación de Sisbén (Promedios de pobreza por municipio)
-    # Incluimos las variables de privación que pediste para el modelo
-    sisben_metrics = sisben.groupBy("cod_mpio").agg(
-        avg("i8").alias("tasa_informalidad_mpio"),     # I8: Trabajo informal
-        avg("i15").alias("tasa_hacinamiento_mpio"),   # I15: Hacinamiento
-        avg("h_5").alias("promedio_ipm_mpio"),         # H_5: Pobreza multidimensional
+    # B. MÉTRICAS SOCIOECONÓMICAS (Agregación Sisbén con nombres claros)
+    # CAMBIO CLAVE: Se usan los nuevos nombres definidos en el diccionario de Silver.
+    sisben_metrics = sisben.groupBy("municipio_codigo").agg(
+        avg("priv_trabajo_informal").alias("tasa_informalidad_mpio"),     # Antes: i8
+        avg("priv_hacinamiento_critico").alias("tasa_hacinamiento_mpio"), # Antes: i15
+        avg("indicador_pobreza_ipm").alias("promedio_ipm_mpio"),          # Antes: h_5
         count("*").alias("poblacion_sisben_mpio")
     )
 
-    # C. Lógica de Deserción UNAD
+    # C. LÓGICA DE DESERCIÓN (Cálculo del Target T+1)
     periods = spark.createDataFrame([
-        ("1701", 2024, 1, 1), ("1702", 2024, 2, 2), ("1703", 2024, 3, 3), ("1704", 2024, 4, 4), ("1705", 2024, 5, 5),
-        ("2031", 2025, 1, 6), ("2032", 2025, 2, 7), ("2033", 2025, 3, 8), ("2034", 2025, 4, 9), ("2035", 2025, 5, 10)
+        ("1701", 2024, 1, 1), ("1702", 2024, 2, 2), ("1703", 2024, 3, 3),
+        ("1704", 2024, 4, 4), ("1705", 2024, 5, 5), ("2031", 2025, 1, 6),
+        ("2032", 2025, 2, 7), ("2033", 2025, 3, 8), ("2034", 2025, 4, 9),
+        ("2035", 2025, 5, 10)
     ], schema="periodo_codigo string, anio int, semestre int, periodo_orden int")
 
+    # Unimos UNAD con el orden cronológico de periodos
     fact = unad.withColumnRenamed("_periodo_codigo", "periodo_codigo") \
                .join(broadcast(periods), on="periodo_codigo", how="left")
 
+    # Ventana por estudiante para identificar si aparece en el siguiente periodo consecutivo
     w = Window.partitionBy("id").orderBy("periodo_orden")
     fact = fact.withColumn("next_periodo_orden", lead("periodo_orden").over(w)) \
                .withColumn("desertion_t1",
-                    when(col("periodo_orden") >= 10, lit(None).cast("int"))
+                    when(col("periodo_orden") >= 10, lit(None).cast("int")) # Último periodo no tiene T+1
                     .when(col("next_periodo_orden").isNull() | (col("next_periodo_orden") > col("periodo_orden") + 1), 1)
                     .otherwise(0))
 
-    # D. EL CRUCE MAESTRO (Traducción y Enriquecimiento)
-    # 1. Normalizamos nombre en UNAD
+    # D. EL GRAN CRUCE (Enriquecimiento Final)
+    # 1. Normalizamos el nombre del municipio de residencia en UNAD
     fact_clean = fact.withColumn("mpio_norm", upper(trim(col("municipio_residencia"))))
 
-    # 2. Pegamos Código DIVIPOLA
-    fact_with_code = fact_clean.join(broadcast(municipio_ref), fact_clean.mpio_norm == municipio_ref.nombre_mpio_ref, "left")
+    # 2. Join 1: Obtenemos el Código DIVIPOLA (Traducción de nombres)
+    fact_with_code = fact_clean.join(
+        broadcast(municipio_ref),
+        fact_clean.mpio_norm == municipio_ref.nombre_mpio_ref,
+        "left"
+    )
 
-    # 3. Pegamos métricas del Sisbén
-    fact_final = fact_with_code.join(broadcast(sisben_metrics), fact_with_code.codigo_divipola == sisben_metrics.cod_mpio, "left")
+    # 3. Join 2: Pegamos las métricas del Sisbén usando el Código
+    # CAMBIO CLAVE: Se une por 'codigo_divipola' vs 'municipio_codigo'
+    fact_final = fact_with_code.join(
+        broadcast(sisben_metrics),
+        fact_with_code.codigo_divipola == sisben_metrics.municipio_codigo,
+        "left"
+    )
 
+    # Guardamos la tabla Maestra particionada por año para optimizar Athena
     write_gold_clean(fact_final, "fact_estudiante_periodo", partition_cols=["anio"])
 
+# -----------------------------------------------------------------------------
+# EJECUCIÓN PRINCIPAL
+# -----------------------------------------------------------------------------
 def main():
+    logger.info(f"Iniciando Job Gold: {JOB_NAME}")
     spark.sql(f"CREATE DATABASE IF NOT EXISTS {GOLD_DATABASE}")
+
     build_raw_gold_layers()
     build_analytical_gold()
+
     job.commit()
+    logger.info("Pipeline Gold finalizado exitosamente.")
 
 if __name__ == "__main__":
     main()

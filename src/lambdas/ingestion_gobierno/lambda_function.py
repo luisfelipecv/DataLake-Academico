@@ -1,10 +1,10 @@
 """
-Ingestion lambda for Datos Abiertos Colombia (Socrata API).
+Lambda de ingesta para Datos Abiertos Colombia (Socrata API).
 
-Streams a single dataset from datos.gov.co into the Bronze (Raw) S3 bucket,
-paginating with $limit/$offset. Each page is uploaded as an independent
-JSON object to bound memory usage and enable parallel re-ingestion.
-Emits structured logs and CloudWatch custom metrics.
+Transmite un conjunto de datos desde datos.gov.co al bucket S3 Bronze (Raw),
+paginando con $limit/$offset. Cada página se carga como un objeto JSON
+independiente para limitar el uso de memoria y permitir la re-ingesta paralela.
+Emite logs estructurados y métricas personalizadas de CloudWatch.
 """
 import json
 import os
@@ -12,6 +12,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import concurrent.futures
 from datetime import datetime, timezone
 from typing import Any, Dict, List
 
@@ -89,13 +90,13 @@ def _fetch_page(
             with urllib.request.urlopen(req, timeout=60) as resp:
                 if resp.status != 200:
                     raise RuntimeError(
-                        f"HTTP {resp.status} on dataset={dataset_id} offset={offset}"
+                        f"HTTP {resp.status} en dataset={dataset_id} offset={offset}"
                     )
                 body = resp.read().decode("utf-8")
             data = json.loads(body)
             if not isinstance(data, list):
                 raise ValueError(
-                    f"Unexpected payload type for dataset={dataset_id}: {type(data).__name__}"
+                    f"Tipo de carga inesperado para dataset={dataset_id}: {type(data).__name__}"
                 )
             return data
         except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, ConnectionError, ValueError, json.JSONDecodeError) as exc:
@@ -111,11 +112,13 @@ def _fetch_page(
             )
             time.sleep(backoff)
     raise RuntimeError(
-        f"Gobierno extraction failed for dataset={dataset_id} offset={offset} after {max_attempts} attempts"
+        f"Extracción fallida para dataset={dataset_id} offset={offset} tras {max_attempts} intentos"
     ) from last_exc
 
 
 def _build_chunk_key(dataset_id: str, extracted_at_iso: str, page: int) -> str:
+    # Se mantiene la lógica original de sobreescritura si así lo deseas,
+    # o puedes agregar 'page' al nombre si quieres archivos separados.
     return f"gobierno/{dataset_id}.json"
 
 
@@ -148,6 +151,17 @@ def _save_local(records: List[dict], dataset_id: str, page: int) -> str:
         json.dump(records, fh, ensure_ascii=False)
     return path
 
+# --- Nueva función de apoyo para los hilos ---
+def _worker_tarea(dataset_id, limit, offset, extracted_at, page):
+    records = _fetch_page(dataset_id, limit, offset)
+    if not records:
+        return 0, None
+    if DRY_RUN:
+        key = _save_local(records, dataset_id, page)
+    else:
+        key = _upload_chunk(records, dataset_id, extracted_at, page)
+    return len(records), key
+
 
 def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     started_monotonic = time.monotonic()
@@ -155,20 +169,20 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
 
     dataset_id = str(event.get("dataset_id", "")).strip()
     if not dataset_id:
-        _log("validation_error", message="dataset_id is required")
-        raise ValueError("'dataset_id' is required in the invocation event")
+        _log("validation_error", message="dataset_id es requerido")
+        raise ValueError("'dataset_id' es requerido en el evento de invocacion")
 
     limit = int(event.get("limit", PAGE_LIMIT_DEFAULT))
     offset_start = int(event.get("offset_start", 0))
     raw_max_pages = event.get("max_pages")
-    max_pages = int(raw_max_pages) if raw_max_pages is not None else None
+    max_pages = int(raw_max_pages) if raw_max_pages is not None else 10 # Por defecto 10 ráfagas
 
     if not DRY_RUN and not DATA_LAKE_BUCKET:
-        _log("config_error", message="DATA_LAKE_BUCKET env var not set")
-        raise RuntimeError("DATA_LAKE_BUCKET is required when not in DRY_RUN mode")
+        _log("config_error", message="DATA_LAKE_BUCKET no configurada")
+        raise RuntimeError("DATA_LAKE_BUCKET es requerida")
 
     _log(
-        "ingestion_started",
+        "ingestion_iniciada",
         dataset_id=dataset_id,
         limit=limit,
         offset_start=offset_start,
@@ -176,69 +190,35 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         bucket=DATA_LAKE_BUCKET if not DRY_RUN else "<dry-run>",
     )
 
-    page = 0
-    offset = offset_start
     total_records = 0
     keys_written: List[str] = []
 
     try:
-        while True:
-            if max_pages is not None and page >= max_pages:
-                _log("max_pages_reached", dataset_id=dataset_id, page=page, max_pages=max_pages)
-                break
-            if context is not None and hasattr(context, "get_remaining_time_in_millis"):
-                remaining_ms = context.get_remaining_time_in_millis()
-                if remaining_ms < TIME_BUDGET_SAFETY_MS:
-                    _log(
-                        "time_budget_low",
-                        dataset_id=dataset_id,
-                        remaining_ms=remaining_ms,
-                        page=page,
-                        offset=offset,
-                    )
-                    break
+        # --- Lógica de hilos para paralelismo ---
+        with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+            tareas = {
+                executor.submit(
+                    _worker_tarea, dataset_id, limit, offset_start + (i * limit), extracted_at, i
+                ): i for i in range(max_pages)
+            }
 
-            records = _fetch_page(dataset_id, limit, offset)
-            if not records:
-                _log(
-                    "dataset_drained",
-                    dataset_id=dataset_id,
-                    total_pages=page,
-                    total_records=total_records,
-                )
-                break
-
-            if DRY_RUN:
-                key = _save_local(records, dataset_id, page)
-            else:
-                key = _upload_chunk(records, dataset_id, extracted_at, page)
-            keys_written.append(key)
-
-            total_records += len(records)
-            page += 1
-            offset += limit
-
-            _log(
-                "page_uploaded",
-                dataset_id=dataset_id,
-                page=page,
-                records=len(records),
-                total_records=total_records,
-                key=key,
-            )
+            for future in concurrent.futures.as_completed(tareas):
+                num_pagina = tareas[future]
+                num_registros, key = future.result()
+                if key:
+                    total_records += num_registros
+                    keys_written.append(key)
+                    _log("pagina_procesada", page=num_pagina, registros=num_registros, key=key)
 
         elapsed = time.monotonic() - started_monotonic
         _emit_metric("IngestionRecords", total_records, DatasetId=dataset_id)
-        _emit_metric("IngestionPages", page, DatasetId=dataset_id)
         _emit_metric("IngestionDurationSeconds", elapsed, unit="Seconds", DatasetId=dataset_id)
         _emit_metric("IngestionSuccess", 1, DatasetId=dataset_id)
 
         _log(
-            "ingestion_completed",
+            "ingestion_completada",
             dataset_id=dataset_id,
             total_records=total_records,
-            total_pages=page,
-            last_offset=offset,
             elapsed_seconds=round(elapsed, 2),
         )
 
@@ -247,11 +227,8 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             "storage": "local" if DRY_RUN else "s3",
             "source": SOURCE_NAME,
             "dataset_id": dataset_id,
-            "bucket": DATA_LAKE_BUCKET if not DRY_RUN else None,
             "total_records": total_records,
-            "total_pages": page,
-            "last_offset": offset,
-            "keys_written_sample": keys_written[:5],
+            "keys_written": keys_written[:5],
             "elapsed_seconds": round(elapsed, 2),
             "extracted_at": extracted_at,
         }
@@ -260,12 +237,9 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         elapsed = time.monotonic() - started_monotonic
         _emit_metric("IngestionFailure", 1, DatasetId=dataset_id)
         _log(
-            "ingestion_failed",
+            "ingestion_fallida",
             dataset_id=dataset_id,
             error=str(exc),
-            error_type=type(exc).__name__,
-            page=page,
-            total_records=total_records,
             elapsed_seconds=round(elapsed, 2),
         )
         raise
