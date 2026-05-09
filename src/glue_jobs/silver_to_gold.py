@@ -61,13 +61,11 @@ def write_gold_clean(df: DataFrame, table_name: str, partition_cols: Optional[Li
     df_final = df.withColumn("_gold_processed_at", current_timestamp()) \
                  .withColumn("_gold_run_id", lit(RUN_ID))
 
-    # SOLO ESCRIBIR DATOS. Eliminamos DROP TABLE y saveAsTable.
     writer = df_final.write.mode("overwrite").format("parquet")
 
     if partition_cols:
         writer = writer.partitionBy(*partition_cols)
 
-    # Usamos .save(path) en lugar de saveAsTable
     writer.save(output_path)
     logger.info(f"Datos Gold escritos en S3: {table_name}")
 
@@ -78,10 +76,10 @@ def build_raw_gold_layers():
     """Mantiene versiones íntegras de las dimensiones originales en Gold."""
     logger.info("Generando capas Raw Gold para auditoría y BI...")
     tables = {
-        "snies_graduados": "dim_raw_snies_graduados",
-        "spadies_creditoicetex": "dim_raw_spadies_creditos",
-        "gobierno_sisben_iv": "dim_raw_gobierno_sisben",
-        "gobierno_internet_fijo": "dim_raw_gobierno_internet"
+        "snies_graduados": "dim_gold_snies_graduados",
+        "spadies_creditoicetex": "dim_gold_spadies_creditos",
+        "gobierno_sisben_iv": "dim_gold_gobierno_sisben",
+        "gobierno_internet_fijo": "dim_gold_gobierno_internet"
     }
     for silver_name, gold_name in tables.items():
         df = safe_spark_table(SILVER_DATABASE, silver_name)
