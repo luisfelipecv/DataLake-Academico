@@ -54,22 +54,22 @@ def safe_spark_table(db: str, table: str) -> Optional[DataFrame]:
         return None
 
 def write_gold_clean(df: DataFrame, table_name: str, partition_cols: Optional[List[str]] = None) -> None:
-    """Escribe en S3 en formato Parquet y registra la tabla en el catálogo de Glue."""
+    """Escribe en S3 en formato Parquet de forma atómica."""
     output_path = f"s3://{GOLD_BUCKET}/{table_name}/"
-
-    # Limpieza del catálogo para evitar duplicados o hashes
-    spark.sql(f"DROP TABLE IF EXISTS {GOLD_DATABASE}.{table_name}")
 
     # Auditoría técnica
     df_final = df.withColumn("_gold_processed_at", current_timestamp()) \
                  .withColumn("_gold_run_id", lit(RUN_ID))
 
-    writer = df_final.write.mode("overwrite").format("parquet").option("path", output_path)
+    # SOLO ESCRIBIR DATOS. Eliminamos DROP TABLE y saveAsTable.
+    writer = df_final.write.mode("overwrite").format("parquet")
+
     if partition_cols:
         writer = writer.partitionBy(*partition_cols)
 
-    writer.saveAsTable(f"{GOLD_DATABASE}.{table_name}")
-    logger.info(f"Tabla Gold materializada: {table_name}")
+    # Usamos .save(path) en lugar de saveAsTable
+    writer.save(output_path)
+    logger.info(f"Datos Gold escritos en S3: {table_name}")
 
 # -----------------------------------------------------------------------------
 # 1. CAPA RAW GOLD (Espejo de Silver para Auditoría)
