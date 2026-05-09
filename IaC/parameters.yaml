@@ -10,6 +10,24 @@ parameters:
   GlueSilverToGoldScriptKey: glue/silver_to_gold.py
   ScheduleExpression: "cron(0 7 * * ? *)"
   ScheduleState: DISABLED
+  # Superset en EC2 (sub-stack opcional). Override al deploy:
+  #   EnableSuperset=true
+  #   SupersetVpcId=vpc-xxxx        (default VPC: aws ec2 describe-vpcs --filters Name=is-default,Values=true)
+  #   SupersetSubnetId=subnet-xxxx  (subnet publica de esa VPC)
+  #   SupersetAllowedCidr=$(curl -s https://checkip.amazonaws.com)/32
+  #   SupersetAdminPassword=<password seguro>
+  #   SupersetSshKeyPairName=<keypair> (opcional; vacio = solo SSM Session Manager)
+  EnableSuperset: "false"
+  SupersetVpcId: ""
+  SupersetSubnetId: ""
+  SupersetSshKeyPairName: ""
+  SupersetAllowedCidr: 0.0.0.0/32
+  SupersetAdminEmail: admin@datalake.local
+  SupersetAdminPassword: ChangeMeAtDeploy123
+  SupersetVersion: 4.1.1
+  SupersetInstanceType: t4g.small
+  SupersetRootVolumeSize: 20
+  SupersetAmiSsmParameter: /aws/service/canonical/ubuntu/server/22.04/stable/current/arm64/hvm/ebs-gp2/ami-id
 tags:
   Project: data-lake-academico
   Environment: dev

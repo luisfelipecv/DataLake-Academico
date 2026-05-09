@@ -52,6 +52,58 @@ Parameters:
     AllowedValues: [ENABLED, DISABLED]
     Description: Permite habilitar/deshabilitar el trigger sin redeploy
 
+  # Sub-stack opcional: Superset en EC2 para visualizacion transitoria
+  EnableSuperset:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: Si es "true", despliega Apache Superset en EC2 (sub-stack opcional)
+  SupersetAllowedCidr:
+    Type: String
+    Default: 0.0.0.0/32
+    Description: >-
+      CIDR (IP/32) que puede acceder a Superset y SSH. Solo aplica si
+      EnableSuperset=true. Obtener con: curl -s https://checkip.amazonaws.com
+  SupersetVpcId:
+    Type: String
+    Default: ""
+    Description: VPC ID donde lanzar la instancia (typically la default VPC). Override al deploy.
+  SupersetSubnetId:
+    Type: String
+    Default: ""
+    Description: Subnet publica en la AZ deseada. Override al deploy.
+  SupersetSshKeyPairName:
+    Type: String
+    Default: ""
+    Description: KeyPair EC2 existente para SSH. Vacio = solo acceso por SSM Session Manager.
+  SupersetAdminEmail:
+    Type: String
+    Default: admin@datalake.local
+  SupersetAdminPassword:
+    Type: String
+    Default: ChangeMeAtDeploy123
+    NoEcho: true
+    Description: Password del admin Superset. Override OBLIGATORIO al deploy real.
+  SupersetVersion:
+    Type: String
+    Default: 4.1.1
+  SupersetInstanceType:
+    Type: String
+    Default: t4g.small
+    AllowedValues: [t4g.micro, t4g.small, t4g.medium, t3.small]
+  SupersetRootVolumeSize:
+    Type: Number
+    Default: 20
+    MinValue: 10
+    MaxValue: 100
+  SupersetAmiSsmParameter:
+    Type: String
+    Default: /aws/service/canonical/ubuntu/server/22.04/stable/current/arm64/hvm/ebs-gp2/ami-id
+    Description: SSM parameter path para el AMI ID (default = Ubuntu 22.04 ARM64)
+
+Conditions:
+  DeploySuperset: !Equals [!Ref EnableSuperset, "true"]
+
 Resources:
 
   # 1. Capa criptografica
@@ -183,6 +235,38 @@ Resources:
         ScheduleState: !Ref ScheduleState
       TimeoutInMinutes: 5
 
+  # 9. Superset en EC2 (opcional, solo si EnableSuperset=true)
+  SupersetStack:
+    Type: AWS::CloudFormation::Stack
+    Condition: DeploySuperset
+    DependsOn:
+      - KmsStack
+      - S3Stack
+      - GlueStack
+      - AthenaStack
+    Properties:
+      TemplateURL: !Sub "${ArtifactsBucketUrl}/template-superset.yaml"
+      Parameters:
+        ProjectName: !Ref ProjectName
+        Environment: !Ref Environment
+        KmsKeyArn: !GetAtt KmsStack.Outputs.KmsKeyArn
+        SilverBucketName: !GetAtt S3Stack.Outputs.SilverBucketName
+        GoldBucketName: !GetAtt S3Stack.Outputs.GoldBucketName
+        AthenaResultsBucketName: !GetAtt S3Stack.Outputs.AthenaResultsBucketName
+        SilverDatabaseName: !GetAtt GlueStack.Outputs.SilverDatabaseName
+        GoldDatabaseName: !GetAtt GlueStack.Outputs.GoldDatabaseName
+        VpcId: !Ref SupersetVpcId
+        SubnetId: !Ref SupersetSubnetId
+        AllowedCidr: !Ref SupersetAllowedCidr
+        SshKeyPairName: !Ref SupersetSshKeyPairName
+        AmiSsmParameter: !Ref SupersetAmiSsmParameter
+        InstanceType: !Ref SupersetInstanceType
+        RootVolumeSize: !Ref SupersetRootVolumeSize
+        AdminEmail: !Ref SupersetAdminEmail
+        AdminPassword: !Ref SupersetAdminPassword
+        SupersetVersion: !Ref SupersetVersion
+      TimeoutInMinutes: 20
+
 Outputs:
   RawBucketName:
     Description: Bucket capa Bronze (Raw)
@@ -217,3 +301,21 @@ Outputs:
   GoldDatabaseName:
     Description: Glue Database Gold
     Value: !GetAtt GlueStack.Outputs.GoldDatabaseName
+
+  # Outputs Superset (solo si EnableSuperset=true)
+  SupersetUiUrl:
+    Condition: DeploySuperset
+    Description: URL HTTP de Superset (esperar ~5-8 min tras CREATE_COMPLETE)
+    Value: !GetAtt SupersetStack.Outputs.SupersetUiUrl
+  SupersetPublicIp:
+    Condition: DeploySuperset
+    Description: IP publica estatica (Elastic IP)
+    Value: !GetAtt SupersetStack.Outputs.SupersetPublicIp
+  SupersetSsmCommand:
+    Condition: DeploySuperset
+    Description: Comando SSM Session Manager (no requiere KeyPair)
+    Value: !GetAtt SupersetStack.Outputs.SupersetSsmCommand
+  SupersetSshCommand:
+    Condition: DeploySuperset
+    Description: Comando SSH (solo si SupersetSshKeyPairName fue proporcionado)
+    Value: !GetAtt SupersetStack.Outputs.SupersetSshCommand

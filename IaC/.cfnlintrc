@@ -9,5 +9,6 @@ templates:
   - template-step.yaml
   - template-eventbridge.yaml
   - template-athena.yaml
+  - template-superset.yaml
 ignore_checks:
   - W3005

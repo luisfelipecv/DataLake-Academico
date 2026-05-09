@@ -1,0 +1,432 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Apache Superset desplegado en una instancia EC2 (single-container con SQLite
+  metadata) para visualizacion transitoria de la capa Gold. La instancia usa
+  un IAM Role (no access keys) con permisos minimos sobre Athena/Glue/S3
+  silver+gold y resultados Athena. UserData instala Docker + imagen oficial
+  apache/superset extendida con PyAthena.
+
+Parameters:
+  ProjectName:
+    Type: String
+  Environment:
+    Type: String
+  KmsKeyArn:
+    Type: String
+    Description: ARN de la KMS Key del proyecto (para Athena results)
+  SilverBucketName:
+    Type: String
+  GoldBucketName:
+    Type: String
+  AthenaResultsBucketName:
+    Type: String
+  SilverDatabaseName:
+    Type: String
+  GoldDatabaseName:
+    Type: String
+
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC donde lanzar la instancia (usar la default de la cuenta)
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: Subnet publica en la AZ deseada (debe pertenecer a VpcId)
+
+  AllowedCidr:
+    Type: String
+    Description: >-
+      CIDR permitido para SSH (22) y Superset UI (8088). Usar /32 para
+      restringir a una sola IP publica. Obtener con curl -s https://checkip.amazonaws.com
+    AllowedPattern: '^([0-9]{1,3}\.){3}[0-9]{1,3}/(3[0-2]|[12]?[0-9])$'
+    ConstraintDescription: "CIDR IPv4 valido (ej 200.93.50.10/32)"
+
+  SshKeyPairName:
+    Type: String
+    Default: ""
+    Description: >-
+      Nombre de un EC2 KeyPair existente para SSH. Dejar vacio para acceso solo
+      via SSM Session Manager (mas limpio, sin .pem flotando).
+
+  AmiSsmParameter:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/canonical/ubuntu/server/22.04/stable/current/arm64/hvm/ebs-gp2/ami-id
+    Description: AMI SSM lookup. Default = Ubuntu 22.04 ARM64 mas reciente
+
+  InstanceType:
+    Type: String
+    Default: t4g.small
+    AllowedValues:
+      - t4g.micro     # 1 GB / 2 vCPU ARM (~$6/mes 24/7)
+      - t4g.small     # 2 GB / 2 vCPU ARM (~$12/mes)  recomendado
+      - t4g.medium    # 4 GB / 2 vCPU ARM (~$24/mes)
+      - t3.small      # 2 GB / 2 vCPU x86 (~$15/mes) si la AMI ARM falla
+    Description: Tipo de instancia EC2
+
+  RootVolumeSize:
+    Type: Number
+    Default: 20
+    MinValue: 10
+    MaxValue: 100
+    Description: Tamano del EBS gp3 raiz en GB
+
+  SupersetVersion:
+    Type: String
+    Default: 4.1.1
+    AllowedPattern: '^[0-9]+\.[0-9]+\.[0-9]+$'
+
+  AdminEmail:
+    Type: String
+    Default: admin@datalake.local
+    AllowedPattern: '^[^\s@]+@[^\s@]+\.[^\s@]+$'
+
+  AdminPassword:
+    Type: String
+    NoEcho: true
+    MinLength: 12
+    MaxLength: 64
+    AllowedPattern: '^[A-Za-z0-9!@#%^&*()_+=\-\[\]{}<>.,?/:;|~]{12,64}$'
+    ConstraintDescription: "12-64 chars alfanum + simbolos seguros. Excluye comillas, apostrofe, espacio, dolar, backtick, backslash"
+
+Conditions:
+  HasKeyPair: !Not [!Equals [!Ref SshKeyPairName, ""]]
+
+Resources:
+
+  # MANAGED POLICY: permisos minimos del rol de la instancia (Athena+Glue+S3 silver/gold)
+  SupersetReadOnlyManagedPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub "${ProjectName}-superset-policy"
+      Description: Permisos minimos del rol EC2 de Superset (Athena+Glue+S3 silver/gold)
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AthenaWorkgroupQueries
+            Effect: Allow
+            Action:
+              - athena:StartQueryExecution
+              - athena:StopQueryExecution
+              - athena:GetQueryExecution
+              - athena:GetQueryResults
+              - athena:GetQueryResultsStream
+              - athena:GetWorkGroup
+              - athena:ListQueryExecutions
+              - athena:BatchGetQueryExecution
+            Resource:
+              - !Sub "arn:${AWS::Partition}:athena:${AWS::Region}:${AWS::AccountId}:workgroup/${ProjectName}-workgroup"
+          - Sid: AthenaCatalogDiscovery
+            Effect: Allow
+            Action:
+              - athena:ListWorkGroups
+              - athena:ListDataCatalogs
+              - athena:GetDataCatalog
+              - athena:ListDatabases
+              - athena:GetDatabase
+              - athena:ListTableMetadata
+              - athena:GetTableMetadata
+            Resource:
+              # Wildcard sobre datacatalog/* permite enumerar metadata de todos
+              # los catalogs de la cuenta (solo nombres y schemas, no datos).
+              # PyAthena requiere esto para popular el dropdown de schemas.
+              - !Sub "arn:${AWS::Partition}:athena:${AWS::Region}:${AWS::AccountId}:datacatalog/*"
+          - Sid: GlueCatalogScopedRead
+            Effect: Allow
+            Action:
+              - glue:GetDatabase
+              - glue:GetDatabases
+              - glue:GetTable
+              - glue:GetTables
+              - glue:GetTableVersion
+              - glue:GetTableVersions
+              - glue:GetPartition
+              - glue:GetPartitions
+              - glue:BatchGetPartition
+              - glue:SearchTables
+            Resource:
+              - !Sub "arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:catalog"
+              - !Sub "arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:database/${SilverDatabaseName}"
+              - !Sub "arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:database/${GoldDatabaseName}"
+              - !Sub "arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:table/${SilverDatabaseName}/*"
+              - !Sub "arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:table/${GoldDatabaseName}/*"
+          - Sid: S3ReadSilver
+            Effect: Allow
+            Action:
+              - s3:GetObject
+              - s3:GetObjectVersion
+            Resource: !Sub "arn:${AWS::Partition}:s3:::${SilverBucketName}/*"
+          - Sid: S3ListSilver
+            Effect: Allow
+            Action:
+              - s3:ListBucket
+              - s3:GetBucketLocation
+            Resource: !Sub "arn:${AWS::Partition}:s3:::${SilverBucketName}"
+          - Sid: S3ReadGold
+            Effect: Allow
+            Action:
+              - s3:GetObject
+              - s3:GetObjectVersion
+            Resource: !Sub "arn:${AWS::Partition}:s3:::${GoldBucketName}/*"
+          - Sid: S3ListGold
+            Effect: Allow
+            Action:
+              - s3:ListBucket
+              - s3:GetBucketLocation
+            Resource: !Sub "arn:${AWS::Partition}:s3:::${GoldBucketName}"
+          - Sid: S3RWAthenaResults
+            Effect: Allow
+            Action:
+              - s3:GetObject
+              - s3:GetObjectVersion
+              - s3:PutObject
+              - s3:AbortMultipartUpload
+              - s3:ListMultipartUploadParts
+            Resource: !Sub "arn:${AWS::Partition}:s3:::${AthenaResultsBucketName}/*"
+          - Sid: S3ListAthenaResults
+            Effect: Allow
+            Action:
+              - s3:ListBucket
+              - s3:GetBucketLocation
+            Resource: !Sub "arn:${AWS::Partition}:s3:::${AthenaResultsBucketName}"
+          - Sid: KmsForLakeData
+            Effect: Allow
+            Action:
+              - kms:Decrypt
+              - kms:GenerateDataKey
+              - kms:DescribeKey
+            Resource: !Ref KmsKeyArn
+
+  # IAM ROLE para la instancia EC2 (assume role por ec2.amazonaws.com)
+  SupersetInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-superset-role"
+      Description: Rol EC2 para la instancia de Superset (Athena/Glue/S3 + SSM Session Manager)
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Path: /service-role/
+      ManagedPolicyArns:
+        - !Ref SupersetReadOnlyManagedPolicy
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore"
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # INSTANCE PROFILE: envoltura del rol para attach a EC2
+  SupersetInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub "${ProjectName}-superset-profile"
+      Path: /service-role/
+      Roles:
+        - !Ref SupersetInstanceRole
+
+  # SECURITY GROUP: SSH 22 + Superset 8088 desde AllowedCidr; egress all
+  SupersetSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub "${ProjectName}-superset-sg"
+      GroupDescription: SG para EC2 Superset (SSH 22 + UI 8088 desde AllowedCidr)
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref AllowedCidr
+          Description: SSH desde IP del operador
+        - IpProtocol: tcp
+          FromPort: 8088
+          ToPort: 8088
+          CidrIp: !Ref AllowedCidr
+          Description: Superset UI desde IP del operador
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: Egress all (para Docker pull, Athena, Glue, etc.)
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # EC2 INSTANCE con UserData que instala Docker + Superset
+  SupersetInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref AmiSsmParameter
+      InstanceType: !Ref InstanceType
+      SubnetId: !Ref SubnetId
+      SecurityGroupIds:
+        - !Ref SupersetSecurityGroup
+      IamInstanceProfile: !Ref SupersetInstanceProfile
+      KeyName: !If [HasKeyPair, !Ref SshKeyPairName, !Ref "AWS::NoValue"]
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs:
+            VolumeSize: !Ref RootVolumeSize
+            VolumeType: gp3
+            DeleteOnTermination: true
+            Encrypted: true
+      MetadataOptions:
+        HttpEndpoint: enabled
+        HttpTokens: required
+        HttpPutResponseHopLimit: 2
+      UserData:
+        Fn::Base64:
+          Fn::Sub: |
+            #!/bin/bash
+            set -euo pipefail
+            exec > >(tee /var/log/user-data.log) 2>&1
+
+            REGION="${AWS::Region}"
+            ATHENA_WG="${ProjectName}-workgroup"
+            ATHENA_RESULTS="${AthenaResultsBucketName}"
+            ADMIN_EMAIL="${AdminEmail}"
+
+            # 1) Instalar Docker + plugins + utilidades
+            while fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1; do sleep 2; done
+            export DEBIAN_FRONTEND=noninteractive
+            apt-get update -y
+            apt-get install -y ca-certificates curl gnupg openssl jq
+            install -m 0755 -d /etc/apt/keyrings
+            curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+            chmod a+r /etc/apt/keyrings/docker.gpg
+            . /etc/os-release
+            echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu ${!VERSION_CODENAME} stable" > /etc/apt/sources.list.d/docker.list
+            apt-get update -y
+            apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+
+            # 2) Setup directorio
+            install -d -m 0755 /opt/superset
+            cd /opt/superset
+            SUPERSET_SECRET_KEY=$(openssl rand -base64 42 | tr -d '\n')
+
+            # 3) Dockerfile derivado: agrega PyAthena al runtime oficial
+            cat > /opt/superset/Dockerfile <<DOCKERFILE_EOF
+            FROM apache/superset:${SupersetVersion}
+            USER root
+            RUN pip install --no-cache-dir 'pyathena[pandas,sqlalchemy]==3.7.0'
+            USER superset
+            DOCKERFILE_EOF
+
+            # 4) docker-compose.yml (heredoc con quote = no interpola shell)
+            cat > /opt/superset/docker-compose.yml <<'COMPOSE_EOF'
+            services:
+              superset:
+                build: .
+                container_name: superset
+                restart: unless-stopped
+                env_file:
+                  - .env
+                ports:
+                  - "8088:8088"
+                volumes:
+                  - superset_home:/app/superset_home
+                healthcheck:
+                  test: ["CMD", "curl", "-f", "http://localhost:8088/health"]
+                  interval: 30s
+                  timeout: 10s
+                  retries: 5
+                  start_period: 60s
+            volumes:
+              superset_home:
+            COMPOSE_EOF
+
+            # 5) .env (sin AWS keys: el container hereda credenciales del IAM Role
+            #    de la instancia via Instance Metadata Service)
+            cat > /opt/superset/.env <<ENV_EOF
+            SUPERSET_SECRET_KEY=${!SUPERSET_SECRET_KEY}
+            SUPERSET_LOAD_EXAMPLES=no
+            SQLALCHEMY_DATABASE_URI=sqlite:////app/superset_home/superset.db?check_same_thread=false
+            AWS_DEFAULT_REGION=${!REGION}
+            ATHENA_WORKGROUP=${!ATHENA_WG}
+            ATHENA_RESULTS_BUCKET=${!ATHENA_RESULTS}
+            ENV_EOF
+            chmod 600 /opt/superset/.env
+
+            # 6) Build & up
+            docker compose build
+            docker compose up -d
+
+            # 7) Esperar al container
+            sleep 30
+            for i in $(seq 1 60); do
+              if docker compose exec -T superset bash -c 'superset --version' >/dev/null 2>&1; then break; fi
+              sleep 5
+            done
+
+            # 8) Inicializar metadata
+            docker compose exec -T superset superset db upgrade
+            docker compose exec -T superset superset init
+
+            # 9) Crear admin (sin loguear password)
+            set +x
+            docker compose exec -T superset superset fab create-admin \
+              --username admin \
+              --firstname Admin \
+              --lastname DataLake \
+              --email "${!ADMIN_EMAIL}" \
+              --password '${AdminPassword}'
+            set -x
+
+            echo "Superset bootstrap completed at $(date -Iseconds)" > /var/log/superset-bootstrap-done
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-superset"
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ELASTIC IP estatica (mientras este attached a una instancia running es gratis)
+  SupersetEip:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  SupersetEipAssociation:
+    Type: AWS::EC2::EIPAssociation
+    Properties:
+      AllocationId: !GetAtt SupersetEip.AllocationId
+      InstanceId: !Ref SupersetInstance
+
+Outputs:
+  SupersetInstanceId:
+    Description: ID de la instancia EC2
+    Value: !Ref SupersetInstance
+    Export:
+      Name: !Sub "${ProjectName}-superset-instance-id"
+  SupersetRoleArn:
+    Description: ARN del IAM Role de la instancia
+    Value: !GetAtt SupersetInstanceRole.Arn
+    Export:
+      Name: !Sub "${ProjectName}-superset-role-arn"
+  SupersetSecurityGroupId:
+    Description: ID del Security Group
+    Value: !Ref SupersetSecurityGroup
+  SupersetPublicIp:
+    Description: IP publica estatica (Elastic IP)
+    Value: !Ref SupersetEip
+  SupersetUiUrl:
+    Description: URL HTTP de Superset (espera ~5-8 min tras CREATE_COMPLETE)
+    Value: !Sub "http://${SupersetEip}:8088"
+  SupersetSshCommand:
+    Description: Comando SSH (solo si proporcionaste SshKeyPairName)
+    Value: !Sub "ssh -i ${SshKeyPairName}.pem ubuntu@${SupersetEip}"
+  SupersetSsmCommand:
+    Description: Comando SSM Session Manager (no requiere KeyPair)
+    Value: !Sub "aws ssm start-session --target ${SupersetInstance} --region ${AWS::Region}"
+  SupersetAdminUsername:
+    Description: Usuario admin inicial de Superset
+    Value: admin

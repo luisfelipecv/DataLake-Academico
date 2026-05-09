@@ -25,7 +25,7 @@ Trabajo de grado del programa de Ingeniería de Sistemas (UNAD), línea de
 9. [Costos esperados](#9-costos-esperados)
 10. [Solución de problemas comunes](#10-solución-de-problemas-comunes)
 11. [Limpieza completa](#11-limpieza-completa)
-12. [Migración entre convenciones de nombres](#12-migración-entre-convenciones-de-nombres)
+12. [Apache Superset (visualización transitoria)](#12-apache-superset-visualización-transitoria)
 13. [Referencias](#13-referencias)
 
 ---
@@ -574,7 +574,496 @@ echo "Infraestructura completamente eliminada."
 
 ---
 
-## 12. Referencias
+## 12. Apache Superset (visualización transitoria)
+
+Sub-stack opcional que despliega **Apache Superset** sobre una instancia **EC2** para construir dashboards y reportes contra la capa Gold vía Athena. Es una solución transitoria mientras se construye la web app definitiva del trabajo de grado. Costo aproximado: **~$12-15/mes 24/7** (t4g.small + EBS gp3 20 GB + EIP), o **~$5-7/mes** si apagas la instancia fuera de horas de trabajo.
+
+> No se activa por defecto. Se controla con el parámetro `EnableSuperset=true` al desplegar el master stack.
+
+### 12.1 Arquitectura del sub-stack
+
+```
+master.yaml (CloudFormation)
+   └── SupersetStack [Condition: DeploySuperset]
+         ├── IAM::ManagedPolicy        data-lake-academico-superset-policy (Athena+Glue+S3 silver/gold)
+         ├── IAM::Role                 data-lake-academico-superset-role (assume EC2; +SSM Session Manager)
+         ├── IAM::InstanceProfile      data-lake-academico-superset-profile
+         ├── EC2::SecurityGroup        SSH 22 + UI 8088 desde AllowedCidr
+         ├── EC2::Instance             ubuntu_22_04 ARM64 (t4g.small) con UserData
+         ├── EC2::EIP                  IP elastica estatica
+         └── EC2::EIPAssociation       attach EIP a la instance
+```
+
+**Por qué EC2 y no Lightsail**: cuentas AWS en *Free Plan* (introducido en 2025) no tienen acceso a Lightsail. EC2 t-class sí está incluido. Adicionalmente, EC2 nos permite usar **IAM Instance Role** en lugar de access keys: el container Docker hereda credenciales temporales del role vía Instance Metadata Service, así no hay secretos en `.env` ni en SecretsManager, ni paso manual de configuración post-deploy.
+
+El UserData de la instancia:
+1. Instala Docker + plugin compose
+2. Construye una imagen derivada de `apache/superset:<versión>` con `pyathena[pandas,sqlalchemy]==3.7.0`
+3. Levanta Superset con SQLite metadata en volumen Docker `superset_home`
+4. Inicializa la metadata DB y crea el usuario admin con el password pasado por parámetro
+5. Deja `/opt/superset/.env` solo con `AWS_DEFAULT_REGION` y vars Superset (sin keys; las saca del IMDS)
+
+### 12.2 Permisos IAM del rol `data-lake-academico-superset-role`
+
+| Servicio | Acciones permitidas | Recursos |
+|---|---|---|
+| Athena | `StartQueryExecution`, `Get*`, `Stop*`, `BatchGet*` | WorkGroup `data-lake-academico-workgroup` + `datacatalog/AwsDataCatalog` |
+| Glue Catalog | `Get*`, `BatchGetPartition`, `SearchTables` (solo lectura) | DBs `data_lake_academico_silver` y `_gold` + sus tablas |
+| S3 Silver/Gold | `GetObject`, `ListBucket` (solo lectura) | `silver-${acc}/*` y `gold-${acc}/*` |
+| S3 Athena Results | `GetObject`, `PutObject`, `Abort/ListMultipart`, `ListBucket` | `athena-results-${acc}/*` |
+| KMS | `Decrypt`, `GenerateDataKey`, `DescribeKey` | KMS Key del proyecto |
+| SSM Session Manager | (managed) `AmazonSSMManagedInstanceCore` | global (necesario para SSM) |
+
+**Sin acceso a Bronze/Raw** — el rol no puede leer microdatos UNAD originales, solo las tablas Silver/Gold ya pseudonimizadas.
+
+### 12.3 Despliegue
+
+**Pre-requisitos**:
+- Tu IP pública (solo esa IP podrá llegar al puerto 8088 y SSH).
+- VPC + Subnet pública donde lanzar la EC2 (típicamente la default VPC de la cuenta).
+- (Opcional) Un EC2 KeyPair existente si quieres SSH; sin él, usas SSM Session Manager.
+
+```bash
+# 1) Obtener tu IP pública
+export MY_IP=$(curl -s https://checkip.amazonaws.com)
+echo "Mi IP: ${MY_IP}/32"
+
+# 2) Identificar VPC default y una subnet pública
+export SUPERSET_VPC_ID=$(aws ec2 describe-vpcs \
+  --filters Name=is-default,Values=true \
+  --query 'Vpcs[0].VpcId' --output text --region "${AWS_REGION}")
+export SUPERSET_SUBNET_ID=$(aws ec2 describe-subnets \
+  --filters "Name=vpc-id,Values=${SUPERSET_VPC_ID}" "Name=default-for-az,Values=true" \
+  --query 'Subnets[0].SubnetId' --output text --region "${AWS_REGION}")
+echo "VPC: ${SUPERSET_VPC_ID}  Subnet: ${SUPERSET_SUBNET_ID}"
+
+# 3) (Opcional) Crear un KeyPair si quieres SSH; saltar si solo usarás SSM
+#    aws ec2 create-key-pair --key-name "${PROJECT}-superset-key" --region "${AWS_REGION}" \
+#      --query 'KeyMaterial' --output text > "${PROJECT}-superset-key.pem"
+#    chmod 600 "${PROJECT}-superset-key.pem"
+export SUPERSET_KEYPAIR=""    # vacío = sin SSH, solo SSM Session Manager
+
+# 4) Definir un password fuerte para el admin Superset
+#    (12-64 chars; alfanum + ! @ # % ^ & * ( ) _ + = - [ ] { } < > . , ? / : ; | ~)
+printf 'Superset admin password: '
+read -s SUPERSET_ADMIN_PASS
+echo
+export SUPERSET_ADMIN_PASS
+
+# 5) Subir templates al bucket de artefactos
+aws s3 cp "${IAC_DIR}/template-superset.yaml" \
+  "s3://${ARTIFACTS_BUCKET}/cfn/template-superset.yaml" --sse AES256
+aws s3 cp "${IAC_DIR}/master.yaml" \
+  "s3://${ARTIFACTS_BUCKET}/cfn/master.yaml" --sse AES256
+
+# 6) Deploy con EnableSuperset=true
+aws cloudformation deploy \
+  --stack-name "${PROJECT}" \
+  --template-file "${IAC_DIR}/master.yaml" \
+  --parameter-overrides \
+      ProjectName="${PROJECT}" \
+      Environment="${ENV}" \
+      ArtifactsBucketName="${ARTIFACTS_BUCKET}" \
+      ArtifactsBucketUrl="https://${ARTIFACTS_BUCKET}.s3.${AWS_REGION}.amazonaws.com/cfn" \
+      EnableSuperset=true \
+      SupersetVpcId="${SUPERSET_VPC_ID}" \
+      SupersetSubnetId="${SUPERSET_SUBNET_ID}" \
+      SupersetSshKeyPairName="${SUPERSET_KEYPAIR}" \
+      SupersetAllowedCidr="${MY_IP}/32" \
+      SupersetAdminPassword="${SUPERSET_ADMIN_PASS}" \
+  --capabilities CAPABILITY_NAMED_IAM \
+  --region "${AWS_REGION}" \
+  --no-fail-on-empty-changeset
+```
+
+CloudFormation reporta `CREATE_COMPLETE` en ~3-5 min (recursos AWS). El UserData tarda **~5-8 min adicionales** descargando Docker e imágenes; el endpoint web no responde hasta que termine.
+
+### 12.4 Verificar que el bootstrap terminó
+
+```bash
+# 1) Obtener la IP pública
+export SUPERSET_IP=$(aws cloudformation describe-stacks \
+  --stack-name "${PROJECT}" --region "${AWS_REGION}" \
+  --query "Stacks[0].Outputs[?OutputKey=='SupersetPublicIp'].OutputValue" --output text)
+echo "Superset IP: ${SUPERSET_IP}"
+
+# 2) Obtener el Instance ID
+export SUPERSET_INSTANCE_ID=$(aws ec2 describe-instances \
+  --filters "Name=tag:Project,Values=${PROJECT}" "Name=tag:Name,Values=${PROJECT}-superset" \
+            "Name=instance-state-name,Values=running" \
+  --query 'Reservations[0].Instances[0].InstanceId' --output text --region "${AWS_REGION}")
+echo "Instance ID: ${SUPERSET_INSTANCE_ID}"
+
+# 3) Verificar el archivo marker via SSM Session Manager (sin SSH)
+aws ssm start-session --target "${SUPERSET_INSTANCE_ID}" --region "${AWS_REGION}"
+# Dentro de la sesión:
+sudo ls -la /var/log/superset-bootstrap-done   # si existe -> bootstrap OK
+sudo tail -20 /var/log/user-data.log           # ver progreso del UserData
+exit
+```
+
+> Para usar SSM Session Manager localmente necesitas el plugin: `brew install --cask session-manager-plugin`.
+
+### 12.5 Acceso a la UI
+
+```
+http://<SUPERSET_IP>:8088
+Usuario: admin
+Password: el que pasaste en SupersetAdminPassword
+```
+
+### 12.6 Acceso al servidor de Superset (administración por EC2)
+
+Esta sección documenta cómo conectarse a la instancia EC2 que hospeda Superset, inspeccionar el container Docker, ver logs y operar el servicio. La forma recomendada de acceso es **AWS SSM Session Manager** (no requiere SSH ni KeyPair); SSH es opcional si proporcionaste `SupersetSshKeyPairName` al deploy.
+
+#### 12.6.1 Pre-requisitos en tu máquina local
+
+```bash
+# Plugin SSM Session Manager para AWS CLI (instalación una sola vez)
+brew install --cask session-manager-plugin
+
+# Verificar
+session-manager-plugin
+# Debe imprimir el banner de uso/version
+```
+
+Si no usas Homebrew, descarga el `.pkg` oficial desde la documentación de AWS Systems Manager.
+
+#### 12.6.2 Obtener IDs de la instancia y la IP pública
+
+```bash
+# Instance ID
+export SUPERSET_INSTANCE_ID=$(aws ec2 describe-instances \
+  --filters "Name=tag:Name,Values=${PROJECT}-superset" \
+            "Name=instance-state-name,Values=running" \
+  --query 'Reservations[0].Instances[0].InstanceId' \
+  --output text --region "${AWS_REGION}")
+
+# IP pública (Elastic IP attached)
+export SUPERSET_IP=$(aws cloudformation describe-stacks \
+  --stack-name "${PROJECT}" --region "${AWS_REGION}" \
+  --query "Stacks[0].Outputs[?OutputKey=='SupersetPublicIp'].OutputValue" \
+  --output text)
+
+echo "Instance: ${SUPERSET_INSTANCE_ID}"
+echo "IP:       ${SUPERSET_IP}"
+echo "URL UI:   http://${SUPERSET_IP}:8088"
+```
+
+#### 12.6.3 Conexión interactiva por SSM Session Manager
+
+```bash
+aws ssm start-session --target "${SUPERSET_INSTANCE_ID}" --region "${AWS_REGION}"
+```
+
+Esto abre una shell `sh-5.1$` en la instancia como user `ssm-user`. Para volverte a un shell de Ubuntu con `sudo` disponible:
+
+```bash
+sudo bash      # ahora corres como root con bash
+# o:
+sudo -u ubuntu -i   # cambia al usuario ubuntu (default de la AMI)
+```
+
+Salir: `exit` (cierra la sesión SSM).
+
+#### 12.6.4 Comando único sin sesión interactiva (`send-command`)
+
+Útil para automatización o cuando no quieres abrir shell interactiva:
+
+```bash
+CMD_ID=$(aws ssm send-command \
+  --instance-ids "${SUPERSET_INSTANCE_ID}" \
+  --document-name "AWS-RunShellScript" \
+  --parameters 'commands=["docker ps","docker logs superset --tail 20"]' \
+  --region "${AWS_REGION}" \
+  --query 'Command.CommandId' --output text)
+
+sleep 3
+aws ssm get-command-invocation \
+  --command-id "${CMD_ID}" \
+  --instance-id "${SUPERSET_INSTANCE_ID}" \
+  --region "${AWS_REGION}" \
+  --query 'StandardOutputContent' --output text
+```
+
+#### 12.6.5 Conexión por SSH (opcional, requiere KeyPair)
+
+Solo aplica si pasaste `SupersetSshKeyPairName=<tu-keypair>` al deploy y descargaste el `.pem`:
+
+```bash
+chmod 600 ~/.ssh/${PROJECT}-superset-key.pem
+ssh -i ~/.ssh/${PROJECT}-superset-key.pem ubuntu@${SUPERSET_IP}
+```
+
+**Tunnel SSH para acceder a la UI sin abrir 8088 al mundo** (útil cuando estás en una red distinta a la del SG):
+
+```bash
+ssh -L 8088:localhost:8088 -i ~/.ssh/${PROJECT}-superset-key.pem ubuntu@${SUPERSET_IP}
+# Mantén la sesión abierta y abre en tu navegador http://localhost:8088
+```
+
+#### 12.6.6 Comandos Docker útiles dentro de la instancia
+
+Una vez dentro vía SSM o SSH, todos los comandos asumen `cd /opt/superset` o el path absoluto al `docker-compose.yml`.
+
+| Acción | Comando |
+|---|---|
+| Estado del container | `sudo docker ps` |
+| Estado por compose | `sudo docker compose -f /opt/superset/docker-compose.yml ps` |
+| Logs últimos 100 | `sudo docker logs superset --tail 100` |
+| Logs en streaming | `sudo docker logs superset -f` |
+| Filtrar errores | `sudo docker logs superset --tail 500 2>&1 \| grep -iE "error\|exception"` |
+| Reiniciar Superset | `sudo docker compose -f /opt/superset/docker-compose.yml restart superset` |
+| Detener | `sudo docker compose -f /opt/superset/docker-compose.yml stop` |
+| Iniciar | `sudo docker compose -f /opt/superset/docker-compose.yml up -d` |
+| Recrear (tras cambio en `.env`) | `sudo docker compose -f /opt/superset/docker-compose.yml up -d --force-recreate` |
+| Consumo recursos | `sudo docker stats --no-stream` |
+| Espacio en disco | `df -h /` y `sudo du -sh /var/lib/docker` |
+| RAM y swap | `free -h` |
+| Verificar marker bootstrap | `sudo ls -la /var/log/superset-bootstrap-done` |
+| Log completo del UserData | `sudo less /var/log/user-data.log` |
+
+#### 12.6.7 Comandos administrativos de Superset (CLI Flask App Builder)
+
+```bash
+# Listar usuarios registrados
+sudo docker compose -f /opt/superset/docker-compose.yml exec superset \
+  superset fab list-users
+
+# Crear un usuario adicional (rol Admin/Alpha/Gamma/Public)
+sudo docker compose -f /opt/superset/docker-compose.yml exec superset \
+  superset fab create-user --role Admin --username analista \
+    --firstname Analista --lastname Datos \
+    --email analista@datalake.local --password '<password-fuerte>'
+
+# Resetear el password del admin (si lo olvidaste)
+sudo docker compose -f /opt/superset/docker-compose.yml exec superset \
+  superset fab reset-password --username admin --password '<nuevo-password>'
+
+# Versión de Superset corriendo
+sudo docker compose -f /opt/superset/docker-compose.yml exec superset \
+  superset --version
+```
+
+#### 12.6.8 Backup y restore de la metadata DB (SQLite)
+
+Los dashboards, charts y conexiones viven en `/app/superset_home/superset.db` dentro del container, sobre el volumen Docker `superset_superset_home` (persiste en EBS).
+
+```bash
+# 1) BACKUP — copiar el SQLite al host y descargarlo a tu Mac
+sudo docker cp superset:/app/superset_home/superset.db \
+  /tmp/superset_$(date +%Y%m%d).db
+
+# (Salir de la sesión SSM y descargar via SSM también)
+exit
+aws ssm start-session --target "${SUPERSET_INSTANCE_ID}" --region "${AWS_REGION}" \
+  --document-name AWS-StartPortForwardingSession  # avanzado, ver doc AWS
+# Más simple: usar `aws s3 cp` desde la instance al bucket de artefactos:
+sudo aws s3 cp /tmp/superset_$(date +%Y%m%d).db \
+  s3://${ARTIFACTS_BUCKET}/backups/superset/
+
+# 2) RESTORE — pasar el archivo a la instance y copiarlo dentro del container
+sudo aws s3 cp s3://${ARTIFACTS_BUCKET}/backups/superset/superset_YYYYMMDD.db /tmp/
+sudo docker cp /tmp/superset_YYYYMMDD.db superset:/app/superset_home/superset.db
+sudo docker compose -f /opt/superset/docker-compose.yml restart superset
+```
+
+#### 12.6.9 Editar configuración del container
+
+Si necesitas cambiar variables de entorno (ej. activar feature flags de Superset):
+
+```bash
+sudo nano /opt/superset/.env
+# Aplicar cambios:
+sudo docker compose -f /opt/superset/docker-compose.yml up -d --force-recreate
+```
+
+Si necesitas cambiar la imagen Docker o agregar drivers extras:
+
+```bash
+sudo nano /opt/superset/Dockerfile
+# Por ejemplo, agregar otro driver SQLAlchemy:
+# RUN pip install --no-cache-dir 'redshift-connector==2.x' 'sqlalchemy-redshift==0.x'
+
+sudo docker compose -f /opt/superset/docker-compose.yml build
+sudo docker compose -f /opt/superset/docker-compose.yml up -d
+```
+
+#### 12.6.10 Actualizar la IP del operador en el Security Group
+
+Si tu IP pública cambió (red distinta, ISP), no podrás llegar al puerto 8088. Hay dos formas:
+
+**Opción A — Re-deploy del CFN** (preferida, queda registrado en IaC):
+
+```bash
+export NEW_IP=$(curl -s https://checkip.amazonaws.com)
+# Re-corre el comando completo de aws cloudformation deploy de §12.3
+# pero con SupersetAllowedCidr="${NEW_IP}/32"
+```
+
+**Opción B — Quick fix manual con AWS CLI** (no queda en IaC, mejor solo para emergencias):
+
+```bash
+SG_ID=$(aws ec2 describe-security-groups \
+  --filters "Name=tag:Project,Values=${PROJECT}" \
+            "Name=group-name,Values=${PROJECT}-superset-sg" \
+  --query 'SecurityGroups[0].GroupId' --output text --region "${AWS_REGION}")
+
+# Quitar la regla vieja (sustituye OLD_IP)
+aws ec2 revoke-security-group-ingress --group-id "${SG_ID}" \
+  --protocol tcp --port 22 --cidr OLD_IP/32 --region "${AWS_REGION}"
+aws ec2 revoke-security-group-ingress --group-id "${SG_ID}" \
+  --protocol tcp --port 8088 --cidr OLD_IP/32 --region "${AWS_REGION}"
+
+# Agregar la nueva
+NEW_IP=$(curl -s https://checkip.amazonaws.com)
+aws ec2 authorize-security-group-ingress --group-id "${SG_ID}" \
+  --protocol tcp --port 22 --cidr "${NEW_IP}/32" --region "${AWS_REGION}"
+aws ec2 authorize-security-group-ingress --group-id "${SG_ID}" \
+  --protocol tcp --port 8088 --cidr "${NEW_IP}/32" --region "${AWS_REGION}"
+```
+
+#### 12.6.11 Diagnóstico rápido cuando "no carga"
+
+| Síntoma | Comando de diagnóstico | Causa típica |
+|---|---|---|
+| Browser timeout en `http://IP:8088` | `aws ec2 describe-instances --instance-ids ${SUPERSET_INSTANCE_ID} --query 'Reservations[0].Instances[0].State.Name'` | Instance stopped (start-instances) |
+| Browser "Connection refused" | SSM → `sudo docker ps` | Container detenido (compose up -d) |
+| "Connection reset" | SSM → `sudo docker logs superset --tail 50` | Bootstrap aún en curso, o crash interno |
+| HTTP 200 pero error en SQL Lab | SSM → `sudo docker logs superset \| grep -iE "denied\|forbidden"` | Falta permiso IAM (ampliar managed policy) |
+| Dashboards/usuarios desaparecieron | SSM → `sudo docker volume ls` | Volumen Docker borrado (restore desde backup) |
+| Cambió tu IP pública | `curl -s https://checkip.amazonaws.com` vs SG existente | Actualizar SG (sección 12.6.10) |
+
+### 12.7 Conexión a Athena dentro de Superset
+
+Una vez logueado, ir a **Settings → Database Connections → + Database**, elegir **Amazon Athena** (no "Amazon Athena (legacy)") y usar este SQLAlchemy URI:
+
+```
+awsathena+rest://@athena.us-east-1.amazonaws.com/default?s3_staging_dir=s3%3A%2F%2Fdata-lake-academico-athena-results-<ACCOUNT_ID>%2Fqueries%2F&work_group=data-lake-academico-workgroup
+```
+
+- **Display Name**: `DataLake (Athena)`.
+- Reemplaza `<ACCOUNT_ID>` por tu account real (ej. `462035739083`).
+- El path `/default` no fija un schema único — permite que SQL Lab y Datasets descubran ambos `data_lake_academico_silver` y `data_lake_academico_gold` en el dropdown.
+- **No lleva access keys** — PyAthena/boto3 detectan que están corriendo en EC2 y obtienen credenciales temporales del **Instance Metadata Service** (IMDSv2) usando el rol `data-lake-academico-superset-role` attached a la instancia. Click **Test Connection** → debe responder OK.
+
+> Nota: si vas a SQL Lab y el dropdown SCHEMA aparece vacío con error "There was an error loading the schemas", es que el resource scope de la managed policy no permite enumerar databases. El template ya usa `datacatalog/*` para los actions de discovery (`athena:ListDatabases`, etc.), así que esto solo aplicaría si lo modificaste manualmente.
+
+### 12.8 Reporte básico de validación (queries de ejemplo)
+
+Una vez configurada la conexión Athena, este flujo construye un dashboard mínimo que valida end-to-end el data lake. Demuestra el cruce UNAD ↔ datos abiertos del gobierno y se puede ampliar con más charts.
+
+**Flujo recomendado**: usar **SQL Lab → CREATE CHART** para que cada query se vuelva un *dataset virtual* directo, sin tener que crear datasets persistentes. Más rápido para reportes one-shot.
+
+#### Chart 1 — Tabla "Cobertura socioeconómica por periodo"
+
+En **SQL → SQL Lab** (database `DataLake (Athena)`, schema `data_lake_academico_gold`):
+
+```sql
+SELECT 
+    periodo_codigo,
+    COUNT(id) as total_estudiantes,
+    COUNT(tasa_informalidad_mpio) as estudiantes_con_datos_sisben,
+    ROUND(AVG(promedio_ipm_mpio), 2) as indice_pobreza_promedio,
+    COUNT(desertion_t1) as registros_con_target_desercion
+FROM "data_lake_academico_gold"."fact_estudiante_periodo"
+GROUP BY periodo_codigo
+ORDER BY periodo_codigo;
+```
+
+- **RUN** → cuando aparezcan resultados, **CREATE CHART**.
+- **Choose chart type**: `Table`.
+- **QUERY MODE**: `Raw Records`.
+- **COLUMNS**: las 5 columnas en orden.
+- **ORDERING**: `periodo_codigo` ASC, **ROW LIMIT** 50.
+- **CREATE CHART** → **SAVE** con nombre `Cobertura socioeconómica por periodo`.
+
+#### Chart 2 — Bar Chart "Top 5 municipios por cantidad de estudiantes"
+
+Nueva pestaña en SQL Lab, mismo database/schema:
+
+```sql
+SELECT 
+    municipio_residencia,
+    COUNT(id) as numero_estudiantes,
+    ROUND(AVG(tasa_informalidad_mpio), 4) as informalidad_promedio
+FROM "data_lake_academico_gold"."fact_estudiante_periodo"
+WHERE codigo_divipola IS NOT NULL
+GROUP BY municipio_residencia
+ORDER BY numero_estudiantes DESC
+LIMIT 5;
+```
+
+- **CREATE CHART** → tipo `Bar Chart` (o `Mixed Chart` si quieres una segunda métrica con eje secundario).
+- **QUERY MODE**: `Raw Records`. **X-AXIS**: `municipio_residencia`. **METRICS**: `numero_estudiantes`.
+- **SORT BY METRIC**: `numero_estudiantes` Descending. **ROW LIMIT**: 5.
+- **CREATE CHART** → **SAVE** con nombre `Top 5 municipios por cantidad de estudiantes`.
+
+#### Combinar en un dashboard
+
+- **Dashboards → + Dashboard** → título: `Reporte básico — Cobertura DataLake UNAD`.
+- Panel derecho **CHARTS** → arrastra ambos charts al canvas → redimensiona → **SAVE**.
+
+**Resultado esperado** (validado en deploy real):
+
+| Chart | Filas | Insight |
+|---|---|---|
+| Cobertura socioeconómica | 10 periodos (2024 I/II/III, 2025 I/II/III, …) | ~62% de los estudiantes tienen datos Sisbén cruzados, IPM promedio ≈ 0.32 |
+| Top 5 municipios | Valledupar, Florencia, Cali, Sogamoso, Soacha | Concentración geográfica con tasas de informalidad entre 64-86% |
+
+> Si quieres filtros interactivos (`periodo`, `escuela`) que afecten múltiples charts a la vez, hay que migrar de "datasets virtuales de SQL Lab" a **datasets persistentes** sobre `fact_estudiante_periodo`. Esto se hace en **Datasets → + Dataset** seleccionando la tabla, y luego construyendo los charts con métricas/dimensiones del dataset (no SQL custom). Los filtros del dashboard solo descubren datasets persistentes.
+
+### 12.9 Apagar / prender / destruir (control de costos)
+
+EC2 factura por hora corrida. Tienes tres palancas:
+
+```bash
+# OPCIÓN A: Apagar la instancia (mantiene EBS + EIP, factura solo storage ~$1.6/mes)
+aws ec2 stop-instances --instance-ids "${SUPERSET_INSTANCE_ID}" --region "${AWS_REGION}"
+
+# Reanudar
+aws ec2 start-instances --instance-ids "${SUPERSET_INSTANCE_ID}" --region "${AWS_REGION}"
+# Nota: la EIP se mantiene attached aunque la instance esté stopped, pero AWS
+# cobra ~$3.6/mes por una EIP no asociada a una instance running. Si vas a
+# tener la instance stopped por más de 1 hora, considera la opción B.
+
+# OPCIÓN B: Destruir todo el sub-stack (ahorra 100% del costo Superset)
+aws cloudformation deploy \
+  --stack-name "${PROJECT}" \
+  --template-file "${IAC_DIR}/master.yaml" \
+  --parameter-overrides \
+      ProjectName="${PROJECT}" \
+      Environment="${ENV}" \
+      ArtifactsBucketName="${ARTIFACTS_BUCKET}" \
+      ArtifactsBucketUrl="https://${ARTIFACTS_BUCKET}.s3.${AWS_REGION}.amazonaws.com/cfn" \
+      EnableSuperset=false \
+  --capabilities CAPABILITY_NAMED_IAM \
+  --region "${AWS_REGION}"
+# Destruye instance + EIP + SG + IAM role + ManagedPolicy. Pierdes los
+# dashboards (están en EBS que se borra). Para preservarlos, ver opción C.
+
+# OPCIÓN C: Snapshot del EBS antes de destruir
+EBS_VOLUME_ID=$(aws ec2 describe-instances --instance-ids "${SUPERSET_INSTANCE_ID}" \
+  --query 'Reservations[0].Instances[0].BlockDeviceMappings[0].Ebs.VolumeId' \
+  --output text --region "${AWS_REGION}")
+aws ec2 create-snapshot --volume-id "${EBS_VOLUME_ID}" \
+  --description "${PROJECT}-superset $(date +%Y%m%d)" \
+  --tag-specifications "ResourceType=snapshot,Tags=[{Key=Project,Value=${PROJECT}}]" \
+  --region "${AWS_REGION}"
+# Después corre la opción B. El snapshot persiste (~$0.05/GB/mes).
+```
+
+### 12.10 Limitaciones conocidas
+
+- Single-container con **SQLite metadata**: sin alertas async, sin scheduled exports, sin Celery worker. Para 1-5 users concurrentes alcanza. Si crece, migrar a `docker-compose-non-dev.yml` oficial (Postgres + Redis + worker) y subir a `t4g.medium` (4 GB).
+- **Sin HTTPS** por defecto: tráfico al puerto 8088 va en plaintext. Para defensa de tesis, agregar Caddy + dominio con Let's Encrypt, o usar SSH tunnel local (`ssh -L 8088:localhost:8088 ubuntu@${SUPERSET_IP}`).
+- **Persistencia**: los dashboards viven en SQLite dentro del volumen Docker `superset_home` sobre EBS gp3. Backups vía snapshot EBS (opción C).
+- **UserData no soporta `cfn-signal`** sin recursos extras: CloudFormation reporta CREATE_COMPLETE antes de que el container esté operativo. Verificar `/var/log/superset-bootstrap-done` antes de intentar abrir la UI.
+- **Acceso a IMDS desde el container**: requiere `HttpPutResponseHopLimit: 2` en `MetadataOptions` (ya configurado en el template). Sin esto, PyAthena no obtiene credenciales del role.
+
+---
+
+## 13. Referencias
 
 - **Documento de tesis**: ``
 - **Diagrama de arquitectura**: ``
