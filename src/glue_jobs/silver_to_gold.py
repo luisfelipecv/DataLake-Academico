@@ -170,6 +170,23 @@ def build_analytical_gold():
                                     col("total_periodos_matriculados") / 
                                     (col("ultimo_periodo") - col("primer_periodo") + 1))
     
+
+    # 4. ENRIQUECIMIENTO DE CONECTIVIDAD (MinTIC)
+    # Calculamos accesos residenciales por municipio
+    mintic_res = mintic.filter(col("segmento").contains("RESIDENCIAL")) \
+                    .groupBy("cod_municipio").agg(count("no_de_accesos").alias("total_accesos_res"))
+    
+    # Cruzamos con nuestra tabla maestra usando el codigo_divipola
+    fact_final = fact_final.join(
+        broadcast(mintic_res),
+        fact_final.codigo_divipola == mintic_res.cod_municipio,
+        "left"
+    ).fillna(0, subset=["total_accesos_res"]) \
+    .withColumn("nivel_conectividad", 
+                when(col("total_accesos_res") == 0, 0) # Nula
+                .when(col("total_accesos_res") < 50, 1) # Baja
+                .otherwise(2)) # Alta
+    
     # ---------------------------------------------------
     # Guardamos la tabla Maestra particionada por año para optimizar Athena
     write_gold_clean(fact_final, "fact_estudiante_periodo", partition_cols=["anio"])
