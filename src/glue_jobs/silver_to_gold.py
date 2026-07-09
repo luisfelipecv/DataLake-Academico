@@ -20,6 +20,7 @@ from pyspark.sql.functions import (
     broadcast, col, current_timestamp, lead, lit, when, count, avg, upper, trim
 )
 from pyspark.sql.window import Window
+from pyspark.sql.functions import col, count, min, max
 
 # -----------------------------------------------------------------------------
 # CONFIGURACIÓN DE ARGUMENTOS
@@ -59,7 +60,7 @@ def write_gold_clean(df: DataFrame, table_name: str, partition_cols: Optional[Li
 
     # Auditoría técnica
     df_final = df.withColumn("_gold_processed_at", current_timestamp()) \
-                 .withColumn("_gold_run_id", lit(RUN_ID))
+                .withColumn("_gold_run_id", lit(RUN_ID))
 
     writer = df_final.write.mode("overwrite").format("parquet")
 
@@ -128,12 +129,12 @@ def build_analytical_gold():
 
     # Unimos UNAD con el orden cronológico de periodos usando inner join
     fact = unad.withColumnRenamed("_periodo_codigo", "periodo_codigo") \
-               .join(broadcast(periods), on="periodo_codigo", how="inner")
+            .join(broadcast(periods), on="periodo_codigo", how="inner")
 
     # Ventana por estudiante para identificar si aparece en algún periodo posterior
     w = Window.partitionBy("id").orderBy("periodo_orden")
     fact = fact.withColumn("next_periodo_orden", lead("periodo_orden").over(w)) \
-               .withColumn("desertion_t1",
+        .withColumn("desertion_t1",
                     when(col("periodo_orden") >= 10, lit(None).cast("int"))
                     .when(col("next_periodo_orden").isNull(), 1)
                     .otherwise(0))
@@ -141,7 +142,7 @@ def build_analytical_gold():
     # D. EL GRAN CRUCE (Enriquecimiento Final)
     # 1. Normalizamos los nombres de municipio y departamento de residencia en la UNAD
     fact_clean = fact.withColumn("mpio_norm", upper(trim(col("municipio_residencia")))) \
-                     .withColumn("depto_norm", upper(trim(col("departamento_residencia"))))
+        .withColumn("depto_norm", upper(trim(col("departamento_residencia"))))
 
     # 2. Join 1: Obtenemos el Código DIVIPOLA validando la localización completa
     fact_with_code = fact_clean.join(
@@ -158,6 +159,18 @@ def build_analytical_gold():
         "left"
     )
 
+    # logica de fidelidad. 
+    w_student = Window.partitionBy("id")
+    fact_final = fact_final.withColumn("total_periodos_matriculados", count(col("id")).over(w_student)) \
+        .withColumn("primer_periodo", min(col("periodo_orden")).over(w_student)) \
+            .withColumn("ultimo_periodo", max(col("periodo_orden")).over(w_student))
+    
+    # Ajuste final: Calculamos la tasa de permanencia
+    fact_final = fact_final.withColumn("tasa_permanencia", 
+                                    col("total_periodos_matriculados") / 
+                                    (col("ultimo_periodo") - col("primer_periodo") + 1))
+    
+    # ---------------------------------------------------
     # Guardamos la tabla Maestra particionada por año para optimizar Athena
     write_gold_clean(fact_final, "fact_estudiante_periodo", partition_cols=["anio"])
 
