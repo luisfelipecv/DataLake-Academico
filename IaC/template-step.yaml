@@ -19,6 +19,12 @@ Parameters:
     Type: String
   GlueSilverToGoldJobName:
     Type: String
+  GlueMlTrainJobName:
+    Type: String
+  GlueMlPredictJobName:
+    Type: String
+  GluePublishDashboardJobName:
+    Type: String
   SilverCrawlerName:
     Type: String
   GoldCrawlerName:
@@ -56,6 +62,9 @@ Resources:
         LambdaGobiernoArn: !Ref LambdaGobiernoArn
         GlueRawToSilverJobName: !Ref GlueRawToSilverJobName
         GlueSilverToGoldJobName: !Ref GlueSilverToGoldJobName
+        GlueMlTrainJobName: !Ref GlueMlTrainJobName
+        GlueMlPredictJobName: !Ref GlueMlPredictJobName
+        GluePublishDashboardJobName: !Ref GluePublishDashboardJobName
         SilverCrawlerName: !Ref SilverCrawlerName
         GoldCrawlerName: !Ref GoldCrawlerName
       DefinitionString: |-
@@ -282,10 +291,95 @@ Resources:
                 {
                   "Variable": "$.goldCrawlerStatus.Crawler.State",
                   "StringEquals": "READY",
-                  "Next": "PipelineSucceeded"
+                  "Next": "ShouldTrainModel"
                 }
               ],
               "Default": "WaitGoldCrawler"
+            },
+            "ShouldTrainModel": {
+              "Type": "Choice",
+              "Choices": [
+                {
+                  "And": [
+                    {"Variable": "$.trainModel", "IsPresent": true},
+                    {"Variable": "$.trainModel", "BooleanEquals": true}
+                  ],
+                  "Next": "MlTrainJob"
+                }
+              ],
+              "Default": "MlPredictJob"
+            },
+            "MlTrainJob": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::glue:startJobRun.sync",
+              "Parameters": {
+                "JobName": "${GlueMlTrainJobName}"
+              },
+              "ResultPath": "$.mlTrainResult",
+              "Retry": [
+                {
+                  "ErrorEquals": ["Glue.ConcurrentRunsExceededException"],
+                  "IntervalSeconds": 30,
+                  "MaxAttempts": 2,
+                  "BackoffRate": 2.0
+                }
+              ],
+              "Catch": [
+                {
+                  "ErrorEquals": ["States.ALL"],
+                  "ResultPath": "$.error",
+                  "Next": "PipelineFailed"
+                }
+              ],
+              "Next": "MlPredictJob"
+            },
+            "MlPredictJob": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::glue:startJobRun.sync",
+              "Parameters": {
+                "JobName": "${GlueMlPredictJobName}"
+              },
+              "ResultPath": "$.mlPredictResult",
+              "Retry": [
+                {
+                  "ErrorEquals": ["Glue.ConcurrentRunsExceededException"],
+                  "IntervalSeconds": 30,
+                  "MaxAttempts": 2,
+                  "BackoffRate": 2.0
+                }
+              ],
+              "Catch": [
+                {
+                  "ErrorEquals": ["States.ALL"],
+                  "ResultPath": "$.error",
+                  "Next": "PipelineFailed"
+                }
+              ],
+              "Next": "PublishDashboard"
+            },
+            "PublishDashboard": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::glue:startJobRun.sync",
+              "Parameters": {
+                "JobName": "${GluePublishDashboardJobName}"
+              },
+              "ResultPath": "$.publishResult",
+              "Retry": [
+                {
+                  "ErrorEquals": ["Glue.ConcurrentRunsExceededException"],
+                  "IntervalSeconds": 30,
+                  "MaxAttempts": 3,
+                  "BackoffRate": 2.0
+                }
+              ],
+              "Catch": [
+                {
+                  "ErrorEquals": ["States.ALL"],
+                  "ResultPath": "$.error",
+                  "Next": "PipelineFailed"
+                }
+              ],
+              "Next": "PipelineSucceeded"
             },
             "PipelineSucceeded": {
               "Type": "Succeed"

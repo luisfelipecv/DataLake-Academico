@@ -178,6 +178,30 @@ Resources:
                 Action:
                   - s3:ListBucket
                 Resource: !Sub "arn:${AWS::Partition}:s3:::${ArtifactsBucketName}"
+        - PolicyName: PublishDashboard
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: WriteWebBucketData
+                Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:DeleteObject
+                Resource: !Sub "arn:${AWS::Partition}:s3:::${ProjectName}-web-${AWS::AccountId}/data/*"
+              - Sid: CheckWebBucket
+                Effect: Allow
+                Action:
+                  - s3:ListBucket
+                  - s3:GetBucketLocation
+                Resource: !Sub "arn:${AWS::Partition}:s3:::${ProjectName}-web-${AWS::AccountId}"
+              - Sid: InvalidateCloudFrontCache
+                Effect: Allow
+                Action:
+                  - cloudfront:CreateInvalidation
+                  - cloudfront:ListDistributions
+                # El DistributionId no es derivable por convencion de nombres;
+                # scoped a la cuenta (ListDistributions solo admite '*').
+                Resource: '*'
         - PolicyName: KmsAccess
           PolicyDocument:
             Version: '2012-10-17'
@@ -257,6 +281,9 @@ Resources:
                 Resource:
                   - !Sub "arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:job/${ProjectName}-raw-to-silver"
                   - !Sub "arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:job/${ProjectName}-silver-to-gold"
+                  - !Sub "arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:job/${ProjectName}-ml-train"
+                  - !Sub "arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:job/${ProjectName}-ml-predict"
+                  - !Sub "arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:job/${ProjectName}-publish-dashboard"
               - Effect: Allow
                 Action:
                   - glue:StartCrawler

@@ -41,6 +41,18 @@ Parameters:
     Type: String
     Default: glue/silver_to_gold.py
     Description: S3 key del script PySpark Silver->Gold
+  GlueMlTrainScriptKey:
+    Type: String
+    Default: glue/ml_train_desertion.py
+    Description: S3 key del script Python Shell de entrenamiento ML
+  GlueMlPredictScriptKey:
+    Type: String
+    Default: glue/ml_predict_desertion.py
+    Description: S3 key del script Python Shell de inferencia batch ML
+  GluePublishDashboardScriptKey:
+    Type: String
+    Default: glue/publish_dashboard.py
+    Description: S3 key del script Python Shell que publica agregados al sitio web
 
   ScheduleExpression:
     Type: String
@@ -51,6 +63,23 @@ Parameters:
     Default: DISABLED
     AllowedValues: [ENABLED, DISABLED]
     Description: Permite habilitar/deshabilitar el trigger sin redeploy
+
+  # Sub-stack opcional: frontend estatico stlite (S3 + CloudFront)
+  EnableFrontend:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: Si es "true", despliega el sitio web de tableros (bucket web + CloudFront)
+  FrontendEnableBasicAuth:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: Proteger el sitio con basic auth via CloudFront Function
+  FrontendBasicAuthToken:
+    Type: String
+    Default: ""
+    NoEcho: true
+    Description: 'base64("usuario:password") para el basic auth. Obligatorio si FrontendEnableBasicAuth=true.'
 
   # Sub-stack opcional: Superset en EC2 para visualizacion transitoria
   EnableSuperset:
@@ -103,6 +132,7 @@ Parameters:
 
 Conditions:
   DeploySuperset: !Equals [!Ref EnableSuperset, "true"]
+  DeployFrontend: !Equals [!Ref EnableFrontend, "true"]
 
 Resources:
 
@@ -176,6 +206,9 @@ Resources:
         ArtifactsBucketName: !Ref ArtifactsBucketName
         GlueRawToSilverScriptKey: !Ref GlueRawToSilverScriptKey
         GlueSilverToGoldScriptKey: !Ref GlueSilverToGoldScriptKey
+        GlueMlTrainScriptKey: !Ref GlueMlTrainScriptKey
+        GlueMlPredictScriptKey: !Ref GlueMlPredictScriptKey
+        GluePublishDashboardScriptKey: !Ref GluePublishDashboardScriptKey
         GlueExecutionRoleArn: !GetAtt IamStack.Outputs.GlueExecutionRoleArn
         RawBucketName: !GetAtt S3Stack.Outputs.RawBucketName
         SilverBucketName: !GetAtt S3Stack.Outputs.SilverBucketName
@@ -214,6 +247,9 @@ Resources:
         LambdaGobiernoArn: !GetAtt LambdasStack.Outputs.LambdaGobiernoArn
         GlueRawToSilverJobName: !GetAtt GlueStack.Outputs.RawToSilverJobName
         GlueSilverToGoldJobName: !GetAtt GlueStack.Outputs.SilverToGoldJobName
+        GlueMlTrainJobName: !GetAtt GlueStack.Outputs.MlTrainJobName
+        GlueMlPredictJobName: !GetAtt GlueStack.Outputs.MlPredictJobName
+        GluePublishDashboardJobName: !GetAtt GlueStack.Outputs.PublishDashboardJobName
         SilverCrawlerName: !GetAtt GlueStack.Outputs.SilverCrawlerName
         GoldCrawlerName: !GetAtt GlueStack.Outputs.GoldCrawlerName
       TimeoutInMinutes: 10
@@ -235,7 +271,23 @@ Resources:
         ScheduleState: !Ref ScheduleState
       TimeoutInMinutes: 5
 
-  # 9. Superset en EC2 (opcional, solo si EnableSuperset=true)
+  # 9. Frontend estatico stlite (opcional, solo si EnableFrontend=true).
+  # Sin DependsOn hacia el resto: el bucket web se resuelve por convencion de
+  # nombres desde el job publish-dashboard, asi CloudFront (~10-20 min) queda
+  # fuera de la ruta critica del pipeline de datos.
+  FrontendStack:
+    Type: AWS::CloudFormation::Stack
+    Condition: DeployFrontend
+    Properties:
+      TemplateURL: !Sub "${ArtifactsBucketUrl}/template-frontend.yaml"
+      Parameters:
+        ProjectName: !Ref ProjectName
+        Environment: !Ref Environment
+        EnableBasicAuth: !Ref FrontendEnableBasicAuth
+        BasicAuthToken: !Ref FrontendBasicAuthToken
+      TimeoutInMinutes: 30
+
+  # 10. Superset en EC2 (opcional, solo si EnableSuperset=true)
   SupersetStack:
     Type: AWS::CloudFormation::Stack
     Condition: DeploySuperset
@@ -301,6 +353,20 @@ Outputs:
   GoldDatabaseName:
     Description: Glue Database Gold
     Value: !GetAtt GlueStack.Outputs.GoldDatabaseName
+
+  # Outputs Frontend (solo si EnableFrontend=true)
+  WebUrl:
+    Condition: DeployFrontend
+    Description: URL HTTPS del sitio de tableros (CloudFront)
+    Value: !GetAtt FrontendStack.Outputs.WebUrl
+  WebBucketName:
+    Condition: DeployFrontend
+    Description: Bucket S3 del sitio web estatico
+    Value: !GetAtt FrontendStack.Outputs.WebBucketName
+  FrontendDistributionId:
+    Condition: DeployFrontend
+    Description: ID de la distribucion CloudFront (para invalidaciones manuales)
+    Value: !GetAtt FrontendStack.Outputs.DistributionId
 
   # Outputs Superset (solo si EnableSuperset=true)
   SupersetUiUrl:

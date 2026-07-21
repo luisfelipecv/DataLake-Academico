@@ -1,0 +1,208 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Frontend: sitio estatico Streamlit (stlite/WebAssembly) para los tableros de
+  desercion. Bucket S3 privado con SSE-S3, CloudFront con Origin Access Control
+  y basic auth opcional via CloudFront Function. Reemplaza al sub-stack Superset.
+  El bucket usa SSE-S3 (no KMS) a proposito: solo contiene agregados publicables
+  (Ley 1581) y evita acoplar la CMK del data lake con CloudFront.
+
+Parameters:
+  ProjectName:
+    Type: String
+  Environment:
+    Type: String
+  EnableBasicAuth:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: Proteger el sitio con basic auth (CloudFront Function, costo $0)
+  BasicAuthToken:
+    Type: String
+    Default: ""
+    NoEcho: true
+    Description: 'base64("usuario:password"). Generar con: echo -n "user:pass" | base64'
+
+# Guard fail-closed: prohibido desplegar creyendo que hay auth con un token vacio.
+Rules:
+  BasicAuthRequiresToken:
+    RuleCondition: !Equals [!Ref EnableBasicAuth, "true"]
+    Assertions:
+      - Assert: !Not [!Equals [!Ref BasicAuthToken, ""]]
+        AssertDescription: >-
+          EnableBasicAuth=true exige un BasicAuthToken no vacio
+          (echo -n "usuario:password" | base64). Para un sitio abierto,
+          despliegue explicitamente con EnableBasicAuth=false.
+
+Conditions:
+  HasBasicAuth: !Equals [!Ref EnableBasicAuth, "true"]
+
+Resources:
+
+  WebBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${ProjectName}-web-${AWS::AccountId}"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireOldVersions
+            Status: Enabled
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 30
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Layer
+          Value: web
+
+  Oac:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub "${ProjectName}-web-oac"
+        Description: "Acceso firmado sigv4 de CloudFront al bucket web privado"
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  # TTL corto para /data/*: red de seguridad ademas de la invalidacion mensual
+  DataCachePolicy:
+    Type: AWS::CloudFront::CachePolicy
+    Properties:
+      CachePolicyConfig:
+        Name: !Sub "${ProjectName}-web-data-cache"
+        Comment: "Agregados del dashboard: TTL corto para reflejar refrescos batch"
+        MinTTL: 0
+        DefaultTTL: 300
+        MaxTTL: 3600
+        ParametersInCacheKeyAndForwardedToOrigin:
+          EnableAcceptEncodingGzip: true
+          EnableAcceptEncodingBrotli: true
+          CookiesConfig:
+            CookieBehavior: none
+          HeadersConfig:
+            HeaderBehavior: none
+          QueryStringsConfig:
+            QueryStringBehavior: none
+
+  BasicAuthFunction:
+    Type: AWS::CloudFront::Function
+    Condition: HasBasicAuth
+    Properties:
+      Name: !Sub "${ProjectName}-web-basic-auth"
+      AutoPublish: true
+      FunctionConfig:
+        Comment: "Basic auth para el dashboard (defensa en profundidad; los datos ya son agregados)"
+        Runtime: cloudfront-js-2.0
+      FunctionCode: !Sub |
+        function handler(event) {
+          var expected = 'Basic ${BasicAuthToken}';
+          var auth = event.request.headers.authorization;
+          if (!auth || auth.value !== expected) {
+            return {
+              statusCode: 401,
+              statusDescription: 'Unauthorized',
+              headers: { 'www-authenticate': { value: 'Basic realm="Observatorio UNAD"' } }
+            };
+          }
+          return event.request;
+        }
+
+  Distribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: !Sub "${ProjectName} tableros de desercion (stlite)"
+        DefaultRootObject: index.html
+        HttpVersion: http2and3
+        PriceClass: PriceClass_100
+        Origins:
+          - Id: s3-web
+            DomainName: !GetAtt WebBucket.RegionalDomainName
+            OriginAccessControlId: !GetAtt Oac.Id
+            S3OriginConfig:
+              OriginAccessIdentity: ""
+        DefaultCacheBehavior:
+          TargetOriginId: s3-web
+          ViewerProtocolPolicy: redirect-to-https
+          Compress: true
+          # Managed-CachingOptimized
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6
+          FunctionAssociations: !If
+            - HasBasicAuth
+            - - EventType: viewer-request
+                FunctionARN: !GetAtt BasicAuthFunction.FunctionMetadata.FunctionARN
+            - !Ref AWS::NoValue
+        CacheBehaviors:
+          - PathPattern: "data/*"
+            TargetOriginId: s3-web
+            ViewerProtocolPolicy: redirect-to-https
+            Compress: true
+            CachePolicyId: !Ref DataCachePolicy
+            FunctionAssociations: !If
+              - HasBasicAuth
+              - - EventType: viewer-request
+                  FunctionARN: !GetAtt BasicAuthFunction.FunctionMetadata.FunctionARN
+              - !Ref AWS::NoValue
+        ViewerCertificate:
+          CloudFrontDefaultCertificate: true
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  WebBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref WebBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowCloudFrontOacRead
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub "${WebBucket.Arn}/*"
+            Condition:
+              StringEquals:
+                'AWS:SourceArn': !Sub "arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${Distribution}"
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !GetAtt WebBucket.Arn
+              - !Sub "${WebBucket.Arn}/*"
+            Condition:
+              Bool:
+                'aws:SecureTransport': 'false'
+
+Outputs:
+  WebBucketName:
+    Value: !Ref WebBucket
+    Export:
+      Name: !Sub "${ProjectName}-web-name"
+  DistributionId:
+    Value: !Ref Distribution
+    Export:
+      Name: !Sub "${ProjectName}-web-distribution-id"
+  WebUrl:
+    Value: !Sub "https://${Distribution.DomainName}"
+    Export:
+      Name: !Sub "${ProjectName}-web-url"

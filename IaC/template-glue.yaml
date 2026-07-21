@@ -15,6 +15,12 @@ Parameters:
     Type: String
   GlueSilverToGoldScriptKey:
     Type: String
+  GlueMlTrainScriptKey:
+    Type: String
+  GlueMlPredictScriptKey:
+    Type: String
+  GluePublishDashboardScriptKey:
+    Type: String
   GlueExecutionRoleArn:
     Type: String
   RawBucketName:
@@ -126,6 +132,91 @@ Resources:
         Environment: !Ref Environment
         Layer: gold
 
+  # JOB ML: ENTRENAMIENTO (Python Shell single-node; el runtime lo fija
+  # PythonVersion + --library-set, por eso NO se declara GlueVersion)
+  MlTrainJob:
+    Type: AWS::Glue::Job
+    Properties:
+      Name: !Sub "${ProjectName}-ml-train"
+      Description: "Entrena HistGradientBoosting de desercion sobre fact_estudiante_semestre y publica model.joblib/metrics.json/feature_schema.json en artifacts"
+      Role: !Ref GlueExecutionRoleArn
+      MaxCapacity: 1.0
+      Timeout: 60
+      MaxRetries: 0
+      ExecutionProperty:
+        MaxConcurrentRuns: 1
+      Command:
+        Name: pythonshell
+        PythonVersion: "3.9"
+        ScriptLocation: !Sub "s3://${ArtifactsBucketName}/${GlueMlTrainScriptKey}"
+      DefaultArguments:
+        "--library-set": "analytics"
+        "--GOLD_BUCKET": !Ref GoldBucketName
+        "--ARTIFACTS_BUCKET": !Ref ArtifactsBucketName
+        "--MODEL_PREFIX": "ml/models/desertion"
+        "--MIN_PRECISION": "0.80"
+      Tags:
+        Project: !Ref ProjectName
+        Environment: !Ref Environment
+        Layer: ml
+
+  # JOB ML: INFERENCIA BATCH (1 DPU: cargar ~500K filas en pandas es inseguro en 1 GB)
+  MlPredictJob:
+    Type: AWS::Glue::Job
+    Properties:
+      Name: !Sub "${ProjectName}-ml-predict"
+      Description: "Scoring batch de riesgo de desercion con el modelo latest; escribe parquet a gold/ml_predictions_desertion"
+      Role: !Ref GlueExecutionRoleArn
+      MaxCapacity: 1.0
+      Timeout: 30
+      MaxRetries: 1
+      ExecutionProperty:
+        MaxConcurrentRuns: 1
+      Command:
+        Name: pythonshell
+        PythonVersion: "3.9"
+        ScriptLocation: !Sub "s3://${ArtifactsBucketName}/${GlueMlPredictScriptKey}"
+      DefaultArguments:
+        "--library-set": "analytics"
+        "--GOLD_BUCKET": !Ref GoldBucketName
+        "--ARTIFACTS_BUCKET": !Ref ArtifactsBucketName
+        "--MODEL_PREFIX": "ml/models/desertion"
+        "--PREDICTIONS_PREFIX": "ml_predictions_desertion"
+      Tags:
+        Project: !Ref ProjectName
+        Environment: !Ref Environment
+        Layer: ml
+
+  # JOB PUBLICACION DASHBOARD (unico dueno de los agregados del sitio web;
+  # el bucket web se resuelve por convencion de nombres, sin cross-stack ref)
+  PublishDashboardJob:
+    Type: AWS::Glue::Job
+    Properties:
+      Name: !Sub "${ProjectName}-publish-dashboard"
+      Description: "Agrega la capa Gold con reglas Ley 1581 (k>=10, supresion complementaria) y publica CSV/JSON al bucket web + invalidacion CloudFront"
+      Role: !Ref GlueExecutionRoleArn
+      MaxCapacity: 1.0
+      Timeout: 30
+      MaxRetries: 1
+      ExecutionProperty:
+        MaxConcurrentRuns: 1
+      Command:
+        Name: pythonshell
+        PythonVersion: "3.9"
+        ScriptLocation: !Sub "s3://${ArtifactsBucketName}/${GluePublishDashboardScriptKey}"
+      DefaultArguments:
+        "--library-set": "analytics"
+        "--GOLD_BUCKET": !Ref GoldBucketName
+        "--ARTIFACTS_BUCKET": !Ref ArtifactsBucketName
+        "--PROJECT_NAME": !Ref ProjectName
+        "--MODEL_PREFIX": "ml/models/desertion"
+        "--PREDICTIONS_PREFIX": "ml_predictions_desertion"
+        "--MIN_CELL": "10"
+      Tags:
+        Project: !Ref ProjectName
+        Environment: !Ref Environment
+        Layer: web
+
   # CRAWLER SILVER
   SilverCrawler:
     Type: AWS::Glue::Crawler
@@ -171,6 +262,9 @@ Resources:
             Exclusions:
               - "**_temporary/**"
               - "**_SUCCESS"
+              - "temp_table_*/**"
+              - "**/*.json"
+              - "**/*.csv"
       TablePrefix: ""
       SchemaChangePolicy:
         UpdateBehavior: UPDATE_IN_DATABASE
@@ -227,6 +321,18 @@ Outputs:
     Value: !Ref SilverToGoldJob
     Export:
       Name: !Sub "${ProjectName}-silver-to-gold"
+  MlTrainJobName:
+    Value: !Ref MlTrainJob
+    Export:
+      Name: !Sub "${ProjectName}-ml-train"
+  MlPredictJobName:
+    Value: !Ref MlPredictJob
+    Export:
+      Name: !Sub "${ProjectName}-ml-predict"
+  PublishDashboardJobName:
+    Value: !Ref PublishDashboardJob
+    Export:
+      Name: !Sub "${ProjectName}-publish-dashboard"
   SilverCrawlerName:
     Value: !Ref SilverCrawler
     Export:

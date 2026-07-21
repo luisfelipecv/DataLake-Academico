@@ -8,8 +8,19 @@ parameters:
   LambdaGobiernoCodeKey: lambdas/extract_gobierno.zip
   GlueRawToSilverScriptKey: glue/raw_to_silver.py
   GlueSilverToGoldScriptKey: glue/silver_to_gold.py
+  GlueMlTrainScriptKey: glue/ml_train_desertion.py
+  GlueMlPredictScriptKey: glue/ml_predict_desertion.py
+  GluePublishDashboardScriptKey: glue/publish_dashboard.py
   ScheduleExpression: "cron(0 7 * * ? *)"
   ScheduleState: DISABLED
+  # Frontend stlite (sub-stack opcional). Override al deploy:
+  #   EnableFrontend=true
+  #   FrontendBasicAuthToken=$(echo -n "usuario:password" | base64)  (obligatorio con basic auth)
+  # IMPORTANTE: desplegar SIEMPRE con el set completo de parametros para no
+  # resetear toggles/token en redeploys parciales.
+  EnableFrontend: "false"
+  FrontendEnableBasicAuth: "true"
+  FrontendBasicAuthToken: ""
   # Superset en EC2 (sub-stack opcional). Override al deploy:
   #   EnableSuperset=true
   #   SupersetVpcId=vpc-xxxx        (default VPC: aws ec2 describe-vpcs --filters Name=is-default,Values=true)
